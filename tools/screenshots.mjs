@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Takes the README / product-page screenshots: starts a throwaway hub with demo data, drives a headless
-// Chromium browser (Edge or Chrome) over the DevTools protocol, and saves PNGs into docs/screenshots/.
+// Chromium browser (Edge or Chrome) over the DevTools protocol, and saves WebP images into docs/img/
+// (<name>-1440.webp and <name>-960.webp; the sign-in screen also as a banner, login-banner.webp).
 //
 //   node tools/screenshots.mjs
 import fs from 'node:fs';
@@ -10,7 +11,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const out = path.join(root, 'docs', 'screenshots');
+const out = path.join(root, 'docs', 'img');
 fs.mkdirSync(out, { recursive: true });
 const data = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-hub-shots-'));
 const PORT = 7790;
@@ -95,12 +96,17 @@ const cdp = (method, params = {}) => new Promise((resolve, reject) => {
   ws.send(JSON.stringify({ id, method, params }));
 });
 const run = async (expr) => (await cdp('Runtime.evaluate', { expression: `(async () => { ${expr} })()`, awaitPromise: true, returnByValue: true })).result.value;
-async function shot(name, { width = 1440, height = 900 } = {}) {
+async function shot(name, { width = 1440, height = 900, banner = null } = {}) {
   await cdp('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false });
   await sleep(700);
-  const { data: png } = await cdp('Page.captureScreenshot', { format: 'png' });
-  fs.writeFileSync(path.join(out, `${name}.png`), Buffer.from(png, 'base64'));
-  console.log(`docs/screenshots/${name}.png`);
+  const save = async (file, clip) => {
+    const { data: img } = await cdp('Page.captureScreenshot', { format: 'webp', quality: 80, ...(clip ? { clip } : {}) });
+    fs.writeFileSync(path.join(out, file), Buffer.from(img, 'base64'));
+    console.log(`docs/img/${file}`);
+  };
+  await save(`${name}-1440.webp`);
+  await save(`${name}-960.webp`, { x: 0, y: 0, width, height, scale: 960 / width });
+  if (banner) await save(`${name}-banner.webp`, { ...banner, scale: 1 });
 }
 const tab = (label) => run(`[...document.querySelectorAll('[role=tab]')].find((t) => t.textContent.trim() === ${JSON.stringify(label)}).click();`);
 
@@ -110,7 +116,7 @@ try {
   await cdp('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-color-scheme', value: 'dark' }] });
   await cdp('Page.navigate', { url: base });
   await sleep(1200);
-  await shot('login');
+  await shot('login', { banner: { x: 130, y: 80, width: 1180, height: 520 } });
   await run(`const r = await fetch('/api/sessions', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: ${JSON.stringify(ADMIN)} }) }).then((r) => r.json()); localStorage.setItem('hub-session', r.token); location.reload();`).catch(() => {});
   await sleep(2000);
   await tab('Overview');
@@ -137,9 +143,6 @@ try {
   await tab('Conversations');
   await run(`[...document.querySelectorAll('#convo-list .convo')].find((b) => b.textContent.includes('#design-review')).click();`);
   await shot('conversations-light');
-  await cdp('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-color-scheme', value: 'dark' }] });
-  await tab('Overview');
-  await shot('mobile', { width: 390, height: 844 });
 } finally {
   ws.close();
   browser.kill();
