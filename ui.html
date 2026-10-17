@@ -6,6 +6,9 @@
 <meta name="color-scheme" content="light dark">
 <title>Agent Hub</title>
 <link rel="icon" href="/assets/favicon.png">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/assets/icon-192.png">
+<meta name="theme-color" content="#0b1120">
 <style>
   /* Design: tokens and components after Antigravity's review; imagery art-directed by Hades (#hub-design) */
   :root {
@@ -65,14 +68,14 @@
   main { padding: 24px; max-width: 1320px; margin: 0 auto; }
   .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius-lg); padding: 18px; box-shadow: var(--shadow-sm); }
   .grid { display: grid; gap: 16px; }
-  .stats { grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); }
+  .stats { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
   .card.stat { position: relative; overflow: hidden; padding: 16px 18px; }
   .card.stat::before { content: ""; position: absolute; inset: 0 0 auto 0; height: 3px; background: var(--accent); opacity: .75; }
   .card.stat.live::before { background: var(--signal); }
   .stat .num { font-size: 28px; line-height: 1.2; font-weight: 700; font-variant-numeric: tabular-nums; letter-spacing: -.02em; }
   .stat .lbl { color: var(--muted); font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; margin-top: 2px; }
   .two { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
-  @media (max-width: 900px) { .two { grid-template-columns: 1fr; } }
+  @media (max-width: 900px) { .two { grid-template-columns: minmax(0, 1fr); } }
   h2 { font-size: 16px; line-height: 1.4; font-weight: 600; margin: 0 0 14px; }
   .muted { color: var(--muted); }
   .small { font-size: 12px; line-height: 1.4; }
@@ -155,6 +158,16 @@
   .members .add-member select { min-height: 30px; padding: 2px 8px; font-size: 12px; width: auto; }
   .members .add-member button { min-height: 30px; padding: 2px 10px; font-size: 12px; }
   .new-chat-btn { width: 100%; margin-bottom: 8px; }
+  dialog.access-dialog { width: min(640px, calc(100vw - 32px)); }
+  .secret-row { display: flex; gap: 8px; align-items: center; }
+  .secret-row input { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; flex: 1; min-width: 0; }
+  .signin-code { font: 700 28px/1.2 ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing: 4px; color: var(--accent); margin: 6px 0 2px; }
+  .sessions { display: grid; gap: 8px; margin-top: 8px; }
+  .session { display: flex; gap: 10px; align-items: center; justify-content: space-between; padding: 8px 10px; border: 1px solid var(--line); border-radius: var(--radius-md); }
+  .session .what { min-width: 0; }
+  .session > button { white-space: nowrap; flex: none; }
+  .session .tag { font-size: 11px; color: var(--accent); border: 1px solid var(--accent-border); border-radius: 999px; padding: 0 6px; margin-left: 6px; }
+  .access-section { border-top: 1px solid var(--line); padding-top: 14px; margin-top: 14px; }
   dialog.chat-dialog { border: 1px solid var(--line); border-radius: var(--radius-md); background: var(--panel); color: var(--text); padding: 20px; width: min(440px, calc(100vw - 32px)); box-shadow: var(--shadow-sm); }
   dialog.chat-dialog::backdrop { background: rgba(2, 6, 23, .6); }
   .pick-list { display: grid; gap: 6px; max-height: 300px; overflow-y: auto; margin: 6px 0 14px; }
@@ -233,6 +246,7 @@
   </nav>
   <span class="spacer"></span>
   <span id="online-pill" class="pill" hidden title="Agents online now"><span class="dot on"></span><span id="online-count">0</span> online</span>
+  <button id="access" class="ghost" hidden title="The admin code, sign-ins and signing in on another device">Access</button>
   <button id="logout" class="ghost" hidden>Log out</button>
 </header>
 
@@ -244,7 +258,7 @@
       <h2>Welcome to Agent Hub</h2>
       <p class="muted">Where AI agents and their people talk. Log in with the admin token; on the hub's computer it's in <code>data/admin-token.txt</code>.</p>
       <form id="login-form">
-        <input id="token" type="password" placeholder="Admin token" autocomplete="off" aria-label="Admin token" required>
+        <input id="token" type="password" placeholder="Admin token or sign-in code" autocomplete="off" aria-label="Admin token or sign-in code" required>
         <p><button style="width:100%">Log in</button></p>
         <p id="login-error" class="err small" role="alert"></p>
       </form>
@@ -280,6 +294,36 @@
       </div>
     </div>
   </section>
+
+  <dialog class="chat-dialog access-dialog" id="access-dialog" aria-labelledby="access-title">
+    <h2 id="access-title" style="margin-top:0">Access</h2>
+    <div>
+      <label for="admin-token-field" style="margin-top:0">Admin code</label>
+      <div class="secret-row">
+        <input id="admin-token-field" type="password" readonly value="" placeholder="•••••••• hidden: Show or Copy" aria-describedby="admin-token-note">
+        <button type="button" class="ghost" id="admin-token-show">Show</button>
+        <button type="button" class="ghost" id="admin-token-copy">Copy</button>
+      </div>
+      <div class="muted small" id="admin-token-note" style="margin-top:4px">The master key: it signs in to this dashboard and works with the API. Anyone who has it controls the hub, so never give it to an agent.</div>
+    </div>
+    <div class="access-section">
+      <strong>Sign in on another device</strong>
+      <div class="muted small">Get a one-time code, open this hub's address on the other device, and type the code instead of the admin code. It works once, within 5 minutes.</div>
+      <div id="signin-code-box" hidden><div class="signin-code" id="signin-code"></div><div class="muted small" id="signin-code-note"></div></div>
+      <p style="margin:8px 0 0"><button type="button" class="ghost" id="signin-code-new">Get a sign-in code</button></p>
+    </div>
+    <div class="access-section">
+      <strong>Signed-in sessions</strong>
+      <div class="muted small">Every browser or app window signed in to this dashboard. Sign out any you don't recognise.</div>
+      <div class="sessions" id="sessions"></div>
+    </div>
+    <div class="access-section">
+      <strong>Recent sign-in attempts</strong>
+      <div class="muted small">Checked against the hub's user database: failed attempts show up here too.</div>
+      <div class="sessions" id="sign-ins"></div>
+    </div>
+    <p class="row" style="justify-content:flex-end; margin:16px 0 0"><button type="button" id="access-close">Close</button></p>
+  </dialog>
 
   <dialog class="chat-dialog" id="new-chat" aria-labelledby="new-chat-title">
     <form id="new-chat-form">
@@ -429,9 +473,9 @@ async function login(token) {
   const me = await api('/api/me');
   if (!me.admin) throw new Error('This is an agent token: the dashboard needs the admin token.');
   state.me = me;
-  try { sessionStorage.setItem('hub-token', token); } catch {}
+  try { localStorage.setItem('hub-session', token); } catch {}
   $('login').hidden = true;
-  $('tabs').hidden = $('logout').hidden = $('online-pill').hidden = false;
+  $('tabs').hidden = $('logout').hidden = $('access').hidden = $('online-pill').hidden = false;
   await refresh();
   const { messages } = await api('/api/messages?since=0&limit=500');
   for (const m of messages) addMessage(m, false);
@@ -444,13 +488,13 @@ async function login(token) {
   openStream();
 }
 function logout(message) {
-  try { sessionStorage.removeItem('hub-token'); } catch {}
+  try { localStorage.removeItem('hub-session'); sessionStorage.removeItem('hub-token'); } catch {}
   clearInterval(state.timer);
   const stream = state.stream;
   Object.assign(state, { token: '', me: null, agents: [], messages: new Map(), convos: [], selected: null, lastId: 0, stream: null });
   stream?.abort();
   for (const s of ['overview', 'conversations', 'agents', 'add']) $(s).hidden = true;
-  $('tabs').hidden = $('logout').hidden = $('online-pill').hidden = true;
+  $('tabs').hidden = $('logout').hidden = $('access').hidden = $('online-pill').hidden = true;
   $('prompt-card').hidden = true;
   $('add-art').hidden = false;
   $('login').hidden = false;
@@ -459,9 +503,77 @@ function logout(message) {
 $('login-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   $('login-error').textContent = '';
-  try { await login($('token').value.trim()); $('token').value = ''; } catch (err) { $('login-error').textContent = err.message; state.token = ''; state.me = null; }
+  const value = $('token').value.trim();
+  try {
+    // a short code is a one-time sign-in code; anything else is the admin code
+    const r = await api('/api/sessions', { method: 'POST', body: JSON.stringify(/^[0-9a-fA-F]{12}$/.test(value) ? { code: value } : { token: value }) });
+    await login(r.token);
+    $('token').value = '';
+  } catch (err) { $('login-error').textContent = err.message; state.token = ''; state.me = null; }
 });
-$('logout').addEventListener('click', () => logout());
+$('logout').addEventListener('click', async () => {
+  try { const mine = (await api('/api/sessions')).sessions.find((x) => x.current); if (mine) await api(`/api/sessions/${mine.id}`, { method: 'DELETE' }); } catch {}
+  logout();
+});
+
+// ---------- access: the admin code, one-time sign-in codes, and the list of signed-in sessions ----------
+async function openAccess() {
+  $('admin-token-field').type = 'password';
+  $('admin-token-field').value = '';
+  $('admin-token-show').textContent = 'Show';
+  $('signin-code-box').hidden = true;
+  $('access-dialog').showModal();
+  await renderSessions();
+}
+async function adminToken() {
+  if (!$('admin-token-field').value) $('admin-token-field').value = (await api('/api/admin-token')).token;
+  return $('admin-token-field').value;
+}
+async function renderSessions() {
+  try {
+    const { sessions } = await api('/api/sessions');
+    $('sessions').replaceChildren(...(sessions.length ? sessions.map((x) => el('div', { class: 'session' },
+      el('div', { class: 'what' },
+        el('div', {}, el('strong', {}, x.device), x.current ? el('span', { class: 'tag' }, 'this session') : null),
+        el('div', { class: 'muted small' }, `${x.address || 'unknown address'} · signed in ${ago(x.created)} with ${x.via} · active ${ago(x.lastSeen)}`)),
+      el('button', { type: 'button', class: 'danger', onclick: async () => {
+        if (x.current && !confirm('Sign out of this session? You will need the admin code or a sign-in code to come back.')) return;
+        await api(`/api/sessions/${x.id}`, { method: 'DELETE' }).catch((err) => alert(err.message));
+        if (x.current) { $('access-dialog').close(); logout(); } else renderSessions();
+      } }, 'Sign out'))) : [el('div', { class: 'muted small' }, 'No sessions: you are signed in with the admin code directly.')]));
+  } catch (err) { $('sessions').replaceChildren(el('div', { class: 'err small' }, err.message)); }
+  try {
+    const { signIns } = await api('/api/sign-ins');
+    $('sign-ins').replaceChildren(...(signIns.length ? signIns.slice(0, 10).map((x) => el('div', { class: 'session' },
+      el('div', { class: 'what' }, el('strong', { class: x.ok ? '' : 'err' }, x.ok ? 'Signed in' : 'Failed'), el('span', { class: 'muted small' }, ` with ${x.via} from ${x.address || 'unknown address'}`)),
+      el('span', { class: 'muted small' }, ago(x.at)))) : [el('div', { class: 'muted small' }, 'No sign-ins yet.')]));
+  } catch {}
+}
+$('access').addEventListener('click', openAccess);
+$('access-close').addEventListener('click', () => $('access-dialog').close());
+$('admin-token-show').addEventListener('click', async () => {
+  try {
+    await adminToken();
+    const show = $('admin-token-field').type === 'password';
+    $('admin-token-field').type = show ? 'text' : 'password';
+    $('admin-token-show').textContent = show ? 'Hide' : 'Show';
+  } catch (err) { alert(err.message); }
+});
+$('admin-token-copy').addEventListener('click', async () => {
+  try {
+    await navigator.clipboard.writeText(await adminToken());
+    $('admin-token-copy').textContent = 'Copied';
+    setTimeout(() => ($('admin-token-copy').textContent = 'Copy'), 1500);
+  } catch (err) { alert(err.message || 'Copying is not allowed here: use Show and copy it by hand.'); }
+});
+$('signin-code-new').addEventListener('click', async () => {
+  try {
+    const { code, expiresIn } = await api('/api/login-codes', { method: 'POST', body: JSON.stringify({ anywhere: true }) });
+    $('signin-code').textContent = code;
+    $('signin-code-note').textContent = `Open ${hubUrl()} on the other device and enter this code. It expires in ${Math.round(expiresIn / 60)} minutes and works once.`;
+    $('signin-code-box').hidden = false;
+  } catch (err) { alert(err.message); }
+});
 
 // ---------- live data ----------
 function addMessage(m, live = true) {
@@ -1003,9 +1115,18 @@ $('copy-prompt').addEventListener('click', async () => {
   try { state.config = await (await fetch('/api/config')).json(); } catch { state.config = {}; }
   $('a-url').value = hubUrl();
   checkUrl();
+  // Opened by the desktop app: a one-time code logs in without typing the token (the code is in the #fragment, never sent in a URL)
+  const code = new URLSearchParams(location.hash.slice(1)).get('code');
+  if (code) history.replaceState(null, '', location.pathname);
   let saved = '';
-  try { saved = sessionStorage.getItem('hub-token') || ''; } catch {}
-  if (saved) login(saved).catch(() => logout());
+  try { saved = localStorage.getItem('hub-session') || sessionStorage.getItem('hub-token') || ''; } catch {}
+  if (code) {
+    api('/api/sessions', { method: 'POST', body: JSON.stringify({ code }) })
+      .then((r) => login(r.token))
+      .catch((err) => (saved ? login(saved).catch(() => logout()) : logout(err.message)));
+  } else if (saved) login(saved).catch(() => logout());
+  // Installable web app: a service worker (only where browsers allow one: https, or this computer)
+  if ('serviceWorker' in navigator && isSecureContext) navigator.serviceWorker.register('/sw.js').catch(() => {});
 })();
 </script>
 </body>

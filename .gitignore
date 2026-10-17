@@ -12,3 +12,4 @@ start-hub.cmd
 # Image masters (generated; assets/ holds the WebP versions)
 art-src/
 hub-forever.cmd
+dist/

@@ -1,25 +1,57 @@
 #!/usr/bin/env node
 // Agent Hub: a small message server where AI agents (and people) on a network talk to each other.
-// No dependencies; Node.js 18+.
+// No dependencies; Node.js 22.13+.
 //
 //   node server.mjs                      listens on 127.0.0.1:7700 (this machine only)
 //   HUB_HOST=0.0.0.0 node server.mjs     listens on the network (every agent needs a token; see README)
 //
+// Users are checked against a SQLite database (data/users.db: token hashes, dashboard sessions, sign-in log) using
+// Node's built-in SQLite, so Node.js 22.13 or later is needed. Messages and profiles stay in data/hub.json.
+//
 // Environment: HUB_HOST, HUB_PORT (7700), HUB_DATA (./data), HUB_ADMIN_TOKEN (generated on first start if unset),
 // HUB_PUBLIC_URL (the address agents should use, shown in onboarding prompts), HUB_MAX_MESSAGES (5000 kept),
 // HUB_RATE (messages per agent per minute, 60).
+// Options (they override the environment): --host, --port, --data, --public-url, --open (open the dashboard
+// in an app window, logged in), --no-open. The packaged desktop apps behave as if started with --open.
 import http from 'node:http';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
-const VERSION = '1.7.0';
-const here = path.dirname(fileURLToPath(import.meta.url));
-const HOST = process.env.HUB_HOST ?? '127.0.0.1';
-const PORT = Number(process.env.HUB_PORT ?? 7700);
-const DATA = path.resolve(process.env.HUB_DATA ?? path.join(here, 'data'));
-const PUBLIC_URL = (process.env.HUB_PUBLIC_URL ?? '').replace(/\/$/, '') || null;
+const VERSION = '1.8.0';
+// Packaged as a single executable (the desktop apps), the hub's own files live inside the executable
+let sea = null;
+try {
+  const mod = (await import('node:sea')).default;
+  if (mod.isSea()) sea = mod;
+} catch {}
+const here = sea ? path.dirname(process.execPath) : path.dirname(fileURLToPath(import.meta.url));
+/** One of the hub's own files (the dashboard, the bridge, images), from the executable or from disk. */
+const appFile = (rel) => (sea ? Buffer.from(sea.getAsset(rel)) : fs.readFileSync(path.join(here, rel)));
+
+const args = process.argv.slice(2);
+const option = (name) => {
+  const i = args.indexOf(`--${name}`);
+  return i >= 0 && args[i + 1] && !args[i + 1].startsWith('--') ? args[i + 1] : undefined;
+};
+if (args.includes('--help') || args.includes('-h')) {
+  console.log(`Agent Hub\n\nOptions: --host <address> (127.0.0.1; 0.0.0.0 = the network)  --port <n> (7700)  --data <folder>\n         --public-url <url> (the address agents use)  --open / --no-open (open the dashboard window)\nEnvironment: HUB_HOST, HUB_PORT, HUB_DATA, HUB_PUBLIC_URL, HUB_ADMIN_TOKEN, HUB_MAX_MESSAGES, HUB_RATE`);
+  process.exit(0);
+}
+/** Where the desktop apps keep their data: the usual per-user application-data folder. */
+function appDataDir() {
+  if (process.platform === 'win32') return path.join(process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'), 'Agent Hub');
+  if (process.platform === 'darwin') return path.join(os.homedir(), 'Library', 'Application Support', 'Agent Hub');
+  return path.join(process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share'), 'agent-hub');
+}
+const HOST = option('host') ?? process.env.HUB_HOST ?? '127.0.0.1';
+const PORT = Number(option('port') ?? process.env.HUB_PORT ?? 7700);
+const DATA = path.resolve(option('data') ?? process.env.HUB_DATA ?? (sea ? appDataDir() : path.join(here, 'data')));
+const PUBLIC_URL = (option('public-url') ?? process.env.HUB_PUBLIC_URL ?? '').replace(/\/$/, '') || null;
+const OPEN = args.includes('--no-open') ? false : args.includes('--open') || !!sea;
 const MAX_MESSAGES = Number(process.env.HUB_MAX_MESSAGES ?? 5000);
 const RATE = Number(process.env.HUB_RATE ?? 60);
 const ONLINE_WINDOW = 2 * 60 * 1000; // active within the last two minutes counts as online
@@ -46,6 +78,70 @@ if (!adminToken) {
 }
 const adminHash = sha256(adminToken);
 
+// ---------- users: who may connect, checked against SQLite ----------
+// Only hashes are stored (sha256 of each token), never the tokens themselves.
+{
+  // node:sqlite still prints an "experimental" warning on some Node versions: keep the console readable
+  const emit = process.emitWarning;
+  process.emitWarning = (warning, ...rest) => (String(warning).includes('SQLite') ? undefined : emit.call(process, warning, ...rest));
+}
+const { DatabaseSync } = await import('node:sqlite');
+const usersDb = new DatabaseSync(path.join(DATA, 'users.db'));
+usersDb.exec(`
+  PRAGMA journal_mode = WAL;
+  CREATE TABLE IF NOT EXISTS admin_credential (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    token_hash TEXT NOT NULL,
+    updated TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS agent_credentials (
+    name TEXT PRIMARY KEY,
+    token_hash TEXT NOT NULL UNIQUE,
+    active INTEGER NOT NULL DEFAULT 1,
+    created TEXT NOT NULL,
+    rotated TEXT
+  );
+  CREATE TABLE IF NOT EXISTS sessions (
+    id TEXT PRIMARY KEY,
+    token_hash TEXT NOT NULL UNIQUE,
+    created TEXT NOT NULL,
+    last_seen TEXT NOT NULL,
+    device TEXT,
+    address TEXT,
+    via TEXT
+  );
+  CREATE TABLE IF NOT EXISTS sign_ins (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at TEXT NOT NULL,
+    address TEXT,
+    via TEXT,
+    ok INTEGER NOT NULL,
+    session_id TEXT
+  );
+  CREATE INDEX IF NOT EXISTS sign_ins_by_address ON sign_ins (address, at);
+`);
+const users = {
+  setAdmin: usersDb.prepare(`INSERT INTO admin_credential (id, token_hash, updated) VALUES (1, ?, ?)
+    ON CONFLICT (id) DO UPDATE SET token_hash = excluded.token_hash, updated = excluded.updated WHERE token_hash != excluded.token_hash`),
+  isAdmin: usersDb.prepare('SELECT 1 AS ok FROM admin_credential WHERE id = 1 AND token_hash = ?'),
+  agentByHash: usersDb.prepare('SELECT name FROM agent_credentials WHERE token_hash = ? AND active = 1'),
+  addAgent: usersDb.prepare('INSERT OR REPLACE INTO agent_credentials (name, token_hash, active, created, rotated) VALUES (?, ?, ?, ?, NULL)'),
+  rotateAgent: usersDb.prepare('UPDATE agent_credentials SET token_hash = ?, active = 1, rotated = ? WHERE name = ?'),
+  setAgentActive: usersDb.prepare('UPDATE agent_credentials SET active = ? WHERE name = ?'),
+  hasAgent: usersDb.prepare('SELECT 1 AS ok FROM agent_credentials WHERE name = ?'),
+  sessionByHash: usersDb.prepare('SELECT id, last_seen FROM sessions WHERE token_hash = ?'),
+  touchSession: usersDb.prepare('UPDATE sessions SET last_seen = ? WHERE id = ?'),
+  addSession: usersDb.prepare('INSERT INTO sessions (id, token_hash, created, last_seen, device, address, via) VALUES (?, ?, ?, ?, ?, ?, ?)'),
+  listSessions: usersDb.prepare('SELECT id, created, last_seen AS lastSeen, device, address, via FROM sessions ORDER BY last_seen DESC'),
+  dropSession: usersDb.prepare('DELETE FROM sessions WHERE id = ?'),
+  pruneSessions: usersDb.prepare('DELETE FROM sessions WHERE id NOT IN (SELECT id FROM sessions ORDER BY last_seen DESC LIMIT 50)'),
+  logSignIn: usersDb.prepare('INSERT INTO sign_ins (at, address, via, ok, session_id) VALUES (?, ?, ?, ?, ?)'),
+  recentFailures: usersDb.prepare('SELECT COUNT(*) AS n FROM sign_ins WHERE address = ? AND ok = 0 AND at > ?'),
+  listSignIns: usersDb.prepare('SELECT at, address, via, ok FROM sign_ins ORDER BY id DESC LIMIT 30'),
+  pruneSignIns: usersDb.prepare('DELETE FROM sign_ins WHERE id <= (SELECT MAX(id) FROM sign_ins) - 1000'),
+};
+users.setAdmin.run(adminHash, new Date().toISOString());
+
 /** @type {{ agents: Record<string, any>, messages: any[], nextId: number }} */
 let db = { agents: {}, messages: [], nextId: 1 };
 if (fs.existsSync(STORE)) db = JSON.parse(fs.readFileSync(STORE, 'utf8'));
@@ -60,16 +156,23 @@ function save() {
 }
 
 // ---------- auth ----------
-const sameHash = (a, b) => a.length === b.length && crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
 /** Returns { name, admin } for a valid bearer token (header, or ?token= for clients that can't set headers). */
 function who(req, url) {
   const header = req.headers.authorization ?? '';
   const token = header.startsWith('Bearer ') ? header.slice(7).trim() : url.searchParams.get('token') ?? '';
   if (!token) return null;
-  const h = sha256(token);
-  if (sameHash(h, adminHash)) return { name: 'admin', admin: true };
-  for (const [name, a] of Object.entries(db.agents)) if (!a.disabled && sameHash(h, a.tokenHash)) return { name, admin: false };
-  return null;
+  const h = sha256(token); // tokens are looked up by their hash: the database never holds a token
+  if (users.isAdmin.get(h)) return { name: 'admin', admin: true };
+  if (token.startsWith('ahs_')) {
+    // a dashboard sign-in (see "dashboard sessions" below)
+    const sess = users.sessionByHash.get(h);
+    if (!sess) return null;
+    const now = Date.now();
+    if (now - Date.parse(sess.last_seen) > 60_000) users.touchSession.run(new Date(now).toISOString(), sess.id);
+    return { name: 'admin', admin: true, session: sess.id };
+  }
+  const row = users.agentByHash.get(h);
+  return row && db.agents[row.name] && !db.agents[row.name].disabled ? { name: row.name, admin: false } : null;
 }
 
 // ---------- presence ----------
@@ -214,6 +317,22 @@ fs.mkdirSync(CATALOG, { recursive: true });
 db.images ??= {};
 db.catalog ??= {};
 db.chats ??= {}; // group chats the admin started: { '#name': { created, by } }
+// Credentials live in users.db: move any left in hub.json by older versions
+{
+  let moved = 0;
+  for (const [name, a] of Object.entries(db.agents)) {
+    if (!a.tokenHash) continue;
+    if (!users.hasAgent.get(name) && a.kind !== 'a2a') users.addAgent.run(name, a.tokenHash, a.disabled ? 0 : 1, a.created ?? new Date().toISOString());
+    delete a.tokenHash;
+    moved++;
+  }
+  for (const [id, sess] of Object.entries(db.sessions ?? {})) users.addSession.run(id, sess.hash, sess.created, sess.lastSeen, sess.device, sess.address, sess.via);
+  if (moved || db.sessions) {
+    delete db.sessions;
+    save();
+    if (moved) console.log(`Moved ${moved} agent credentials into ${path.join(DATA, 'users.db')}.`);
+  }
+}
 db.receiptsFrom ??= db.nextId; // read receipts exist from this message id on
 const MAX_IMAGE = 1024 * 1024;
 const IMAGE_RATE = 30; // shared images per agent per hour
@@ -330,8 +449,8 @@ route('POST', '/api/agents', async ({ me, req }) => {
   if (product !== undefined && product !== null && product !== '' && !db.catalog[product]) throw httpError(400, `unknown product "${product}"`);
   if (kind === 'a2a') return registerRemote(name, { url: a2aUrl, token: a2aToken, description, product });
   const token = newToken();
+  users.addAgent.run(name, sha256(token), 1, new Date().toISOString());
   db.agents[name] = {
-    tokenHash: sha256(token),
     description: String(description ?? '').slice(0, 500),
     kind: typeof kind === 'string' ? kind.slice(0, 32) : null,
     channels: [],
@@ -348,8 +467,10 @@ route('POST', '/api/agents/([a-z0-9_-]+)/rotate', ({ me, params }) => {
   if (!me.admin) throw httpError(403, 'admin only');
   const a = db.agents[params[0]];
   if (!a) throw httpError(404, 'no such agent');
+  if (a.kind === 'a2a') throw httpError(400, 'remote A2A agents have no hub token');
   const token = newToken();
-  a.tokenHash = sha256(token);
+  if (users.hasAgent.get(params[0])) users.rotateAgent.run(sha256(token), new Date().toISOString(), params[0]);
+  else users.addAgent.run(params[0], sha256(token), 1, new Date().toISOString());
   a.disabled = false;
   save();
   return { name: params[0], token };
@@ -359,6 +480,7 @@ route('DELETE', '/api/agents/([a-z0-9_-]+)', ({ me, params }) => {
   if (!me.admin) throw httpError(403, 'admin only');
   if (!db.agents[params[0]]) throw httpError(404, 'no such agent');
   db.agents[params[0]].disabled = true; // keeps the name in the history; the token stops working
+  users.setAgentActive.run(0, params[0]);
   save();
   return { ok: true };
 });
@@ -431,6 +553,75 @@ route('PATCH', '/api/me', async ({ me, req }) => {
   db.agents[me.name].description = String(description ?? '').slice(0, 500);
   save();
   return publicAgent(me.name, db.agents[me.name]);
+});
+
+// ---------- dashboard sessions: every sign-in is listed, and can be signed out on its own ----------
+// Signing in with the admin token (or a one-time code) creates a session token for that browser; the admin token
+// itself is only shown on request, in the dashboard's Access panel.
+const loginCodes = new Map(); // code -> { expires, anywhere }
+/** A one-time sign-in code: for the desktop window (this computer, 1 minute) or for another device (5 minutes). */
+function newLoginCode({ anywhere = false } = {}) {
+  const code = crypto.randomBytes(anywhere ? 6 : 18).toString(anywhere ? 'hex' : 'base64url').toUpperCase();
+  loginCodes.set(code, { expires: Date.now() + (anywhere ? 300_000 : 60_000), anywhere });
+  return code;
+}
+const isLoopback = (req) => ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(req.socket.remoteAddress);
+function describeDevice(ua = '') {
+  const browser = /Edg\//.test(ua) ? 'Edge' : /OPR\//.test(ua) ? 'Opera' : /Chrome\//.test(ua) ? 'Chrome' : /Firefox\//.test(ua) ? 'Firefox' : /Safari\//.test(ua) ? 'Safari' : ua ? 'a browser' : 'unknown';
+  const system = /Windows/.test(ua) ? 'Windows' : /Android/.test(ua) ? 'Android' : /iPhone|iPad/.test(ua) ? 'iOS' : /Mac OS X/.test(ua) ? 'macOS' : /Linux/.test(ua) ? 'Linux' : '';
+  return system ? `${browser} on ${system}` : browser;
+}
+
+
+route('POST', '/api/sessions', async ({ req }) => {
+  const address = String(req.socket.remoteAddress ?? '').replace(/^::ffff:/, '');
+  const now = Date.now();
+  // slow down guessing: 20 failed sign-ins per address per 10 minutes
+  if (users.recentFailures.get(address, new Date(now - 600_000).toISOString()).n >= 20) throw httpError(429, 'too many failed sign-ins from this address: wait a few minutes');
+  const { token, code } = await readJson(req);
+  let via = null;
+  if (typeof code === 'string' && code) {
+    const c = loginCodes.get(code.trim().toUpperCase());
+    loginCodes.delete(code.trim().toUpperCase());
+    if (c && c.expires > now && (c.anywhere || isLoopback(req))) via = c.anywhere ? 'sign-in code' : 'desktop app';
+  } else if (typeof token === 'string' && users.isAdmin.get(sha256(token.trim()))) via = 'admin token';
+  const at = new Date(now).toISOString();
+  if (!via) {
+    users.logSignIn.run(at, address, code ? 'sign-in code' : 'admin token', 0, null);
+    throw httpError(401, code ? 'that sign-in code is wrong or has expired' : 'that is not the admin token');
+  }
+  const id = crypto.randomBytes(6).toString('hex');
+  const sessionToken = 'ahs_' + crypto.randomBytes(24).toString('base64url');
+  users.addSession.run(id, sha256(sessionToken), at, at, describeDevice(req.headers['user-agent']), address, via);
+  users.logSignIn.run(at, address, via, 1, id);
+  users.pruneSessions.run(); // keep the 50 most recent sessions
+  users.pruneSignIns.run(); // and the last 1000 sign-in attempts
+  return { token: sessionToken, session: id };
+}, { open: true });
+route('GET', '/api/sessions', ({ me }) => {
+  if (!me.admin) throw httpError(403, 'admin only');
+  return { sessions: users.listSessions.all().map((x) => ({ ...x, current: x.id === me.session })) };
+});
+// Recent sign-in attempts, successful or not: who has been getting in (or trying to)
+route('GET', '/api/sign-ins', ({ me }) => {
+  if (!me.admin) throw httpError(403, 'admin only');
+  return { signIns: users.listSignIns.all().map((x) => ({ ...x, ok: !!x.ok })) };
+});
+route('DELETE', '/api/sessions/([0-9a-f]+)', ({ me, params }) => {
+  if (!me.admin) throw httpError(403, 'admin only');
+  if (!users.dropSession.run(params[0]).changes) throw httpError(404, 'no such session');
+  return { ok: true };
+});
+// The admin token, for signing in elsewhere or for API use; shown only to a signed-in admin who asks for it
+route('GET', '/api/admin-token', ({ me }) => {
+  if (!me.admin) throw httpError(403, 'admin only');
+  return { token: adminToken, file: ADMIN_FILE, fromEnvironment: !!process.env.HUB_ADMIN_TOKEN };
+});
+route('POST', '/api/login-codes', async ({ me, req }) => {
+  if (!me.admin) throw httpError(403, 'admin only');
+  const body = await readJson(req).catch(() => ({}));
+  const anywhere = body?.anywhere === true;
+  return { code: newLoginCode({ anywhere }), expiresIn: anywhere ? 300 : 60 };
 });
 
 // ---------- chats: the admin starts group chats and adds or removes their members ----------
@@ -753,7 +944,6 @@ async function registerRemote(name, { url, token, description, product }) {
   const card = await readCard(url);
   const endpoint = new URL(card.url, url).href;
   db.agents[name] = {
-    tokenHash: sha256(newToken()), // remote agents talk through the hub's A2A client, not with a hub token
     description: String(description || card.description || '').slice(0, 500),
     kind: 'a2a',
     channels: [],
@@ -811,10 +1001,42 @@ async function forwardA2A(m) {
   }
 }
 
-const UI = fs.readFileSync(path.join(here, 'ui.html'), 'utf8');
-const BRIDGE = fs.readFileSync(path.join(here, 'mcp-bridge.mjs'), 'utf8');
-const ASSETS = path.join(here, 'assets');
+const UI = appFile('ui.html').toString('utf8');
+const BRIDGE = appFile('mcp-bridge.mjs').toString('utf8');
 const ASSET_TYPES = { '.webp': 'image/webp', '.png': 'image/png', '.jpg': 'image/jpeg', '.svg': 'image/svg+xml', '.ico': 'image/x-icon', '.woff2': 'font/woff2' };
+/** The dashboard's images, loaded once: from ./assets, or from the executable (whose asset list is assets/index.json). */
+const ASSET_FILES = new Map();
+for (const name of sea ? JSON.parse(appFile('assets/index.json')) : fs.readdirSync(path.join(here, 'assets'))) {
+  if (ASSET_TYPES[path.extname(name).toLowerCase()]) ASSET_FILES.set(name, appFile(`assets/${name}`));
+}
+// Installable web app: the manifest and a service worker that keeps the dashboard's shell for offline starts
+const MANIFEST = JSON.stringify({
+  name: 'Agent Hub',
+  short_name: 'Agent Hub',
+  description: 'Where AI agents and their people talk',
+  start_url: '/',
+  scope: '/',
+  display: 'standalone',
+  background_color: '#0b1120',
+  theme_color: '#0b1120',
+  icons: [
+    { src: '/assets/icon-192.png', sizes: '192x192', type: 'image/png' },
+    { src: '/assets/icon-512.png', sizes: '512x512', type: 'image/png' },
+    { src: '/assets/icon-maskable-512.png', sizes: '512x512', type: 'image/png', purpose: 'maskable' },
+  ],
+});
+const SERVICE_WORKER = `// Agent Hub ${VERSION}: keeps the dashboard's shell so the app opens instantly; never caches API calls
+const CACHE = 'agent-hub-${VERSION}';
+self.addEventListener('install', (e) => e.waitUntil(caches.open(CACHE).then((c) => c.addAll(['/', '/assets/logo-mark.webp'])).then(() => self.skipWaiting())));
+self.addEventListener('activate', (e) => e.waitUntil(caches.keys().then((keys) => Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k)))).then(() => self.clients.claim())));
+self.addEventListener('fetch', (e) => {
+  const url = new URL(e.request.url);
+  if (e.request.method !== 'GET' || url.origin !== location.origin) return;
+  if (url.pathname === '/' || url.pathname.startsWith('/assets/')) {
+    e.respondWith(fetch(e.request).then((r) => { const copy = r.clone(); caches.open(CACHE).then((c) => c.put(e.request, copy)); return r; }).catch(() => caches.match(e.request)));
+  }
+});
+`;
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url ?? '/', 'http://hub');
@@ -828,14 +1050,21 @@ const server = http.createServer(async (req, res) => {
       });
       return res.end(UI);
     }
-    // Images and other static files for the dashboard (served from ./assets only)
+    // Images for the dashboard (only the hub's own, loaded at startup)
     if (req.method === 'GET' && url.pathname.startsWith('/assets/')) {
       const name = decodeURIComponent(url.pathname.slice('/assets/'.length));
-      const type = ASSET_TYPES[path.extname(name).toLowerCase()];
-      const file = path.join(ASSETS, name);
-      if (!type || !/^[\w./-]+$/.test(name) || name.includes('..') || !file.startsWith(ASSETS + path.sep) || !fs.existsSync(file)) throw httpError(404, 'not found');
-      res.writeHead(200, { 'content-type': type, 'cache-control': 'public, max-age=86400', 'x-content-type-options': 'nosniff' });
-      return fs.createReadStream(file).pipe(res);
+      const file = ASSET_FILES.get(name);
+      if (!file) throw httpError(404, 'not found');
+      res.writeHead(200, { 'content-type': ASSET_TYPES[path.extname(name).toLowerCase()], 'cache-control': 'public, max-age=86400', 'x-content-type-options': 'nosniff' });
+      return res.end(file);
+    }
+    if (req.method === 'GET' && url.pathname === '/manifest.webmanifest') {
+      res.writeHead(200, { 'content-type': 'application/manifest+json', 'cache-control': 'no-cache' });
+      return res.end(MANIFEST);
+    }
+    if (req.method === 'GET' && url.pathname === '/sw.js') {
+      res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'no-cache', 'service-worker-allowed': '/' });
+      return res.end(SERVICE_WORKER);
     }
     // Shared images and catalogue pictures are public (shared images have unguessable ids)
     const shared = req.method === 'GET' && url.pathname.match(/^\/images\/([0-9a-f]{16})\.(png|jpg|webp)$/);
@@ -873,11 +1102,58 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+// ---------- the desktop window ----------
+/** A Chromium-based browser for an app-style window (Edge, Chrome, Chromium, Brave), if one is installed. */
+function findAppBrowser() {
+  const win = [process.env['ProgramFiles(x86)'], process.env.ProgramFiles, process.env.LOCALAPPDATA].filter(Boolean);
+  const candidates = process.platform === 'win32'
+    ? win.flatMap((d) => [path.join(d, 'Microsoft', 'Edge', 'Application', 'msedge.exe'), path.join(d, 'Google', 'Chrome', 'Application', 'chrome.exe'), path.join(d, 'BraveSoftware', 'Brave-Browser', 'Application', 'brave.exe')])
+    : process.platform === 'darwin'
+      ? ['/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge', '/Applications/Chromium.app/Contents/MacOS/Chromium']
+      : ['google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser', 'microsoft-edge', 'brave-browser'].flatMap((b) => (process.env.PATH ?? '').split(':').map((d) => path.join(d, b)));
+  return candidates.find((c) => { try { return fs.statSync(c).isFile(); } catch { return false; } });
+}
+/** Opens the dashboard, logged in through a one-time code (in an app window when a Chromium browser is available). */
+function openDashboard(code) {
+  const url = `http://127.0.0.1:${PORT}/#code=${code}`;
+  const browser = findAppBrowser();
+  const [cmd, cmdArgs] = browser
+    ? [browser, [`--app=${url}`, `--user-data-dir=${path.join(DATA, 'window')}`, '--no-first-run', '--no-default-browser-check', '--window-size=1280,860']]
+    : process.platform === 'win32' ? ['cmd', ['/c', 'start', '""', url.replace(/&/g, '^&')]] : [process.platform === 'darwin' ? 'open' : 'xdg-open', [url]];
+  try {
+    spawn(cmd, cmdArgs, { detached: true, stdio: 'ignore', windowsHide: true }).on('error', () => console.log(`Open ${url.split('#')[0]} in your browser.`)).unref();
+  } catch {
+    console.log(`Open ${url.split('#')[0]} in your browser.`);
+  }
+}
+
+server.on('error', async (e) => {
+  if (e.code !== 'EADDRINUSE') throw e;
+  // Already running (say, the app was opened twice): just open another window onto it
+  if (OPEN) {
+    try {
+      const r = await fetch(`http://127.0.0.1:${PORT}/api/login-codes`, { method: 'POST', headers: { authorization: `Bearer ${adminToken}` } });
+      if (r.ok) {
+        openDashboard((await r.json()).code);
+        console.log(`Agent Hub is already running on port ${PORT}: opened a window onto it.`);
+        process.exit(0);
+      }
+    } catch {}
+  }
+  console.error(`Port ${PORT} is already in use. Is another hub running? Choose another port with --port.`);
+  process.exit(1);
+});
 server.listen(PORT, HOST, () => {
-  console.log(`Agent Hub ${VERSION} listening on http://${HOST}:${PORT}${HOST === '127.0.0.1' ? ' (this machine only; set HUB_HOST=0.0.0.0 to open it to the network)' : ''}`);
+  console.log(`Agent Hub ${VERSION} listening on http://${HOST}:${PORT}${HOST === '127.0.0.1' ? ' (this machine only; use --host 0.0.0.0 or HUB_HOST=0.0.0.0 to open it to the network)' : ''}`);
+  console.log(`Data: ${DATA}`);
+  if (OPEN) {
+    openDashboard(newLoginCode());
+    if (sea) console.log('The dashboard opens in its own window. Keep this window open while you use the hub; close it to stop the hub.');
+  }
 });
 for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => {
   clearTimeout(saveTimer);
   fs.writeFileSync(STORE, JSON.stringify(db), { mode: 0o600 });
+  usersDb.close();
   process.exit(0);
 });

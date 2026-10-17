@@ -317,6 +317,41 @@ try {
     await call(ADMIN, 'POST', '/api/chats/general/members', { name: 'eli' });
     assert((await call(ADMIN, 'GET', '/api/conversations')).data.conversations.find((c) => c.key === '#general').members.includes('eli'));
   });
+  await check('dashboard sessions: sign in, list, sign out; one-time codes; the admin code on request', async () => {
+    assert.equal((await call(null, 'POST', '/api/sessions', { token: 'wrong' })).status, 401);
+    const a = await call(null, 'POST', '/api/sessions', { token: ADMIN });
+    assert.equal(a.status, 200);
+    assert.match(a.data.token, /^ahs_/);
+    const sess = a.data.token;
+    assert.equal((await call(sess, 'GET', '/api/me')).data.admin, true);
+    // the admin code is shown to a signed-in admin, never to agents
+    assert.equal((await call(sess, 'GET', '/api/admin-token')).data.token, ADMIN);
+    assert.equal((await call(eveToken(), 'GET', '/api/admin-token')).status, 403);
+    // a code for another device works once
+    const { code } = (await call(sess, 'POST', '/api/login-codes', { anywhere: true })).data;
+    assert.match(code, /^[0-9A-F]{12}$/);
+    const b = await call(null, 'POST', '/api/sessions', { code: code.toLowerCase() });
+    assert.equal(b.status, 200);
+    assert.equal((await call(null, 'POST', '/api/sessions', { code })).status, 401, 'codes work once');
+    const list = (await call(sess, 'GET', '/api/sessions')).data.sessions;
+    const mine = list.find((x) => x.current);
+    assert.equal(mine.via, 'admin token');
+    const other = list.find((x) => x.via === 'sign-in code');
+    assert(other && !JSON.stringify(list).includes('hash'), 'sessions are listed without their secrets');
+    // signing one out ends just that one
+    assert.equal((await call(sess, 'DELETE', `/api/sessions/${other.id}`)).status, 200);
+    assert.equal((await call(b.data.token, 'GET', '/api/me')).status, 401);
+    assert.equal((await call(sess, 'GET', '/api/me')).status, 200);
+    assert.equal((await call(sess, 'DELETE', `/api/sessions/${mine.id}`)).status, 200);
+    assert.equal((await call(sess, 'GET', '/api/me')).status, 401);
+    // users are verified from SQLite: hashes only, and nothing secret left in hub.json
+    const tries = (await call(ADMIN, 'GET', '/api/sign-ins')).data.signIns;
+    assert(tries.some((t) => !t.ok && t.via === 'admin token') && tries.some((t) => t.ok && t.via === 'sign-in code'));
+    assert(fs.existsSync(path.join(data, 'users.db')));
+    await new Promise((r) => setTimeout(r, 400));
+    const store = fs.readFileSync(path.join(data, 'hub.json'), 'utf8');
+    assert(!store.includes('tokenHash') && !store.includes('"sessions"'), 'credentials are not kept in hub.json');
+  });
   await check('presence: an agent waiting for messages counts as connected and online', async () => {
     const waiting = call(hades, 'GET', '/api/messages?since=999999&wait=3');
     await new Promise((r) => setTimeout(r, 300));
@@ -372,7 +407,8 @@ try {
   });
   console.log(`\n${passed} checks passed`);
 } finally {
-  server.kill();
-  fs.rmSync(data, { recursive: true, force: true });
+  // wait for the hub to exit (it holds users.db open), then remove its data
+  if (server.exitCode === null) await new Promise((r) => { server.once('exit', r); server.kill(); });
+  fs.rmSync(data, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 }
 
