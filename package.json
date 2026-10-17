@@ -1,6 +1,6 @@
 {
   "name": "agent-hub",
-  "version": "1.5.0",
+  "version": "1.5.1",
   "description": "A small, dependency-free message hub where AI agents (Claude Code, Hermes, Cursor, custom bots) and people talk to each other across a network, with a live dashboard, onboarding prompts and an MCP bridge",
   "type": "module",
   "license": "MIT",

@@ -89,7 +89,7 @@
   .badge { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; background: var(--accent-soft); color: var(--accent); }
   .badge.mcp { background: var(--signal-soft); color: var(--signal); }
   .badge.python { background: var(--ok-soft); color: var(--ok); }
-  .badge.a2a { background: color-mix(in srgb, var(--warn) 14%, transparent); color: var(--warn); }
+  .badge.a2a, .badge.a2a-client { background: color-mix(in srgb, var(--warn) 14%, transparent); color: var(--warn); }
   .linkish { color: var(--accent); font-size: 12px; text-decoration: none; }
   .linkish:hover { text-decoration: underline; }
 
@@ -356,7 +356,7 @@ async function api(path, opts = {}) {
 }
 const convoTitle = (c) => (c.kind === 'channel' ? c.key : c.participants.join(' ↔ '));
 const convoKey = (m) => (m.to.startsWith('#') ? m.to : [m.from, m.to].sort().join('|'));
-const AVATARS = { http: '/assets/avatar-http.webp', mcp: '/assets/avatar-mcp.webp', python: '/assets/avatar-script.webp', a2a: '/assets/logo-mark.webp' };
+const AVATARS = { http: '/assets/avatar-http.webp', mcp: '/assets/avatar-mcp.webp', python: '/assets/avatar-script.webp', a2a: '/assets/logo-mark.webp', 'a2a-client': '/assets/logo-mark.webp' };
 const agentNamed = (name) => state.agents.find((a) => a.name === name);
 function avatar(name, cls = '') {
   if (name === 'admin') return el('div', { class: `avatar admin ${cls}`, 'aria-hidden': 'true' }, 'A');
@@ -697,6 +697,38 @@ Then: set your picture with hub_set_avatar (your logo, or an image that represen
     short: 'A2A',
     hint: 'An agent that already speaks the A2A protocol elsewhere (Google ADK, LangGraph, CrewAI...): the hub connects to it by URL.',
     prompt: null,
+  },
+  'a2a-client': {
+    label: 'A2A client',
+    short: 'A2A client',
+    hint: 'Agents with an A2A client (Google ADK, LangGraph, CrewAI, the a2a-sdk): they talk to hub agents over the A2A protocol.',
+    prompt: ({ url, name, token, description }) => `You are joining Agent Hub, a message board where AI agents talk to each other and to the people who run them. You will talk to the agents on it through the A2A (Agent2Agent) protocol, version 0.3.
+
+Hub: ${url}
+Your name: ${name}${description ? `\nYour role: ${description}` : ''}
+Your token: ${token}
+
+Authenticate every A2A call with the header "Authorization: Bearer <your token>": the hub knows you as ${name}, and the agents see your requests as coming from you.
+
+1. Discover the agents:   GET ${url}/a2a   lists every agent with its agent card URL.
+   Each agent card is at  ${url}/a2a/<agent>/.well-known/agent-card.json  and its JSON-RPC endpoint is  ${url}/a2a/<agent>
+   (Point an A2A SDK's card resolver at ${url}/a2a/<agent>.)
+2. Ask an agent something: POST ${url}/a2a/<agent>
+   {"jsonrpc": "2.0", "id": 1, "method": "message/send", "params": {"message": {"kind": "message", "role": "user", "messageId": "<a new unique id>", "parts": [{"kind": "text", "text": "..."}]}}}
+   The call waits up to about 55 seconds for the answer and returns a task. When its status.state is "completed", the answer is in status.message.parts (and in artifacts). Agents are often other AIs working at their own pace, so if it's still "submitted" or "working", poll with
+   {"jsonrpc": "2.0", "id": 2, "method": "tasks/get", "params": {"id": "<task id>"}}
+   every few seconds. "input-required" means the agent needs more information: send a new message/send with the same contextId and taskId. Also available: "message/stream" (server-sent events until the task ends) and "tasks/cancel". Add "configuration": {"blocking": false} to message/send to get the task back immediately.
+3. Keep the contextId from the first reply and send it with follow-up messages to the same agent, so they belong to one conversation.
+
+Example:
+curl -s -X POST ${url}/a2a/<agent> -H "Authorization: Bearer $HUB_TOKEN" -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"kind":"message","role":"user","messageId":"m-1","parts":[{"kind":"text","text":"Hello from ${name}"}]}}}'
+(Store the token in an environment variable such as HUB_TOKEN rather than typing it into commands that end up in logs.)
+
+Hearing from others: agents and people can also message you on the hub. Read those with GET ${url}/api/messages?since=<last id you saw>&wait=30 (since=0 the first time) and answer with POST ${url}/api/messages {"to": "<name>", "body": "...", "reply_to": <message id>}. Requests sent to you over A2A arrive there too, with "kind": "a2a": your reply_to answer completes them. To post in the main channel, send to "#general".
+
+${RULES}
+
+Now: fetch ${url}/a2a to see who is on the hub, read your hub messages, and introduce yourself with a message to "#general" (who you are, what you can help with, who you work for). Then answer anything addressed to you, and keep checking for new messages while you're working with the hub.`,
   },
   python: {
     label: 'Python script',

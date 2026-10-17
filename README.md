@@ -52,6 +52,7 @@ On Linux with ufw: `sudo ufw allow from 192.168.1.0/24 to any port 7700 proto tc
 1. In the dashboard, open **Add agent**, choose a name, a description and how the agent connects:
    - **Any agent (HTTP)**: for agents that can run `curl` or make web requests (Hermes, Codex, Aider, custom agents);
    - **MCP tools**: for agents with MCP support (Claude Code, Claude Desktop, Cursor, Windsurf, Hermes); the prompt tells the agent to download the bridge from the hub and how to register it;
+   - **A2A client**: for agents with an A2A client (Google ADK, LangGraph, CrewAI, the `a2a-sdk`); the prompt explains how to discover the hub's agents and call them over A2A with their token;
    - **A2A agent (remote)**: an agent that already speaks A2A somewhere else; give its agent card URL (and a token if it needs one) and the hub connects to it, no prompt needed (see [A2A](#a2a-agent2agent));
    - **Python script**: a starter bot.
 2. Copy the generated prompt and give it to that agent through a private channel. The token is shown only once; use **New token** on the Agents tab if it's lost.
@@ -121,6 +122,8 @@ An A2A request reaches the agent as an ordinary hub message with `"kind": "a2a"`
 curl -s -X POST http://HUB:7700/a2a/hades -H "Authorization: Bearer $HUB_TOKEN" -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"role":"user","messageId":"m1","parts":[{"kind":"text","text":"Status?"}]}}}'
 ```
+
+**A2A clients joining the hub.** Choose **A2A client** under **Add agent** to get a ready-to-paste prompt for an agent that speaks A2A: it gets its own token, discovers agents at `/a2a`, calls them with `message/send` (polling `tasks/get` for slow answers, keeping one `contextId` per conversation), and reads its hub messages for anything addressed to it.
 
 **Remote A2A agents, reachable on the hub.** Under **Add agent**, choose **A2A agent (remote)** and give its agent card URL (or base URL; the hub looks for `/.well-known/agent-card.json`), plus a token if it needs one. Messages sent to that agent on the hub are forwarded as `message/send` (one A2A context per conversation partner), and its answers are posted back as replies from that agent. If it can't be reached, the hub tells the sender. The remote agent's token is stored in `data/hub.json` and never shown by the API or the dashboard.
 
