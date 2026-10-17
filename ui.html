@@ -145,6 +145,23 @@
   .convo .preview { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .thread { display: flex; flex-direction: column; min-height: 0; padding: 0; overflow: hidden; }
   .thread-head { padding: 14px 18px; border-bottom: 1px solid var(--line); display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+  .members { display: flex; flex-wrap: wrap; gap: 6px; padding: 10px 18px; border-bottom: 1px solid var(--line); align-items: center; }
+  .member { display: inline-flex; align-items: center; gap: 6px; padding: 3px 4px 3px 4px; border: 1px solid var(--line); border-radius: 999px; background: var(--panel); font-size: 12px; }
+  .member .avatar { width: 22px; height: 22px; border-radius: 50%; font-size: 10px; }
+  .member .avatar-wrap .dot { width: 9px; height: 9px; right: -2px; bottom: -2px; border-width: 1.5px; }
+  .member .remove { width: 22px; height: 22px; min-height: 0; padding: 0; border-radius: 50%; background: transparent; color: var(--muted); border: 0; font-size: 14px; line-height: 1; display: grid; place-items: center; }
+  .member .remove:hover, .member .remove:focus-visible { background: color-mix(in srgb, var(--bad) 14%, transparent); color: var(--bad); }
+  .members .add-member { display: inline-flex; gap: 6px; align-items: center; margin-left: auto; }
+  .members .add-member select { min-height: 30px; padding: 2px 8px; font-size: 12px; width: auto; }
+  .members .add-member button { min-height: 30px; padding: 2px 10px; font-size: 12px; }
+  .new-chat-btn { width: 100%; margin-bottom: 8px; }
+  dialog.chat-dialog { border: 1px solid var(--line); border-radius: var(--radius-md); background: var(--panel); color: var(--text); padding: 20px; width: min(440px, calc(100vw - 32px)); box-shadow: var(--shadow-sm); }
+  dialog.chat-dialog::backdrop { background: rgba(2, 6, 23, .6); }
+  .pick-list { display: grid; gap: 6px; max-height: 300px; overflow-y: auto; margin: 6px 0 14px; }
+  .pick { display: flex; align-items: center; gap: 10px; padding: 6px 8px; border: 1px solid var(--line); border-radius: var(--radius-md); cursor: pointer; font-weight: 400; margin: 0; }
+  .pick:has(input:checked) { border-color: var(--accent-border); background: var(--mine); }
+  .pick input { width: auto; margin: 0; }
+  .pick .avatar { width: 28px; height: 28px; }
   .thread-body { flex: 1; overflow: auto; padding: 16px 18px; min-height: 260px; background: color-mix(in srgb, var(--bg) 55%, var(--panel)); }
   .compose { display: flex; gap: 8px; padding: 12px 18px; border-top: 1px solid var(--line); align-items: flex-end; flex-wrap: wrap; }
   .compose select { width: auto; }
@@ -253,6 +270,7 @@
       <div class="card convo-list" id="convo-list" role="listbox" aria-label="Conversations"></div>
       <div class="card thread">
         <div class="thread-head"><strong id="thread-title">All messages</strong> <span id="thread-sub" class="muted small"></span></div>
+        <div class="members" id="thread-members" hidden></div>
         <div class="thread-body" id="thread-body" aria-live="polite"></div>
         <form class="compose" id="compose">
           <select id="compose-to" aria-label="Send to"></select>
@@ -262,6 +280,18 @@
       </div>
     </div>
   </section>
+
+  <dialog class="chat-dialog" id="new-chat" aria-labelledby="new-chat-title">
+    <form id="new-chat-form">
+      <h2 id="new-chat-title" style="margin-top:0">New chat</h2>
+      <label for="nc-name">Chat name</label>
+      <input id="nc-name" placeholder="for example design-review" pattern="#?[a-z0-9][a-z0-9_\-]{0,31}" required autocomplete="off">
+      <div class="muted small" style="margin-top:4px">Lower case letters, digits, - and _. Only the agents you add (and you) see this chat.</div>
+      <label style="margin-top:14px">Agents in this chat</label>
+      <div class="pick-list" id="nc-agents"></div>
+      <p class="row" style="justify-content:flex-end; margin:0"><span id="nc-error" class="err small" style="margin-right:auto"></span><button type="button" class="ghost" id="nc-cancel">Cancel</button> <button id="nc-create">Start chat</button></p>
+    </form>
+  </dialog>
 
   <section id="agents" hidden>
     <div class="card table-wrap">
@@ -491,6 +521,7 @@ async function refresh() {
   renderOverviewAgents();
   renderConvoList();
   renderComposeTargets();
+  if (!$('conversations').hidden) renderMembers();
   if (firstLoad) { renderLatest(); if (!$('conversations').hidden) renderThread(); }
 }
 
@@ -517,6 +548,8 @@ function renderOverviewAgents() {
 /** Who should see a message: its recipient, or every member of its channel (as the hub knows them now) except the sender. */
 function audienceOf(m) {
   if (!m.to.startsWith('#')) return [m.to];
+  const members = state.convos.find((c) => c.key === m.to)?.members;
+  if (members) return members.filter((n) => n !== m.from && (!agentNamed(n)?.created || agentNamed(n).created <= m.ts));
   return state.agents.filter((a) => !a.disabled && a.kind !== 'a2a' && a.name !== m.from && (m.to === '#general' || a.channels?.includes(m.to)) && (!a.created || a.created <= m.ts)).map((a) => a.name);
 }
 /** "Sent / Seen by" line under a message, like a chat app: grey tick = sent, cyan double tick = seen by everyone. */
@@ -572,8 +605,8 @@ function renderLatest() {
 
 // ---------- conversations ----------
 function renderConvoList() {
-  const items = [{ key: null, icon: '★', title: 'All messages', sub: `${state.messages.size} messages` }, ...state.convos.map((c) => ({ key: c.key, icon: c.kind === 'channel' ? '#' : '↔', title: convoTitle(c), sub: c.last ? `${c.last.from}: ${c.last.body}` : '', count: c.count }))];
-  $('convo-list').replaceChildren(...items.map((it) => el('button', { class: 'convo', role: 'option', 'aria-selected': String(state.selected === it.key), onclick: () => { state.selected = it.key; renderConvoList(); renderThread(); } },
+  const items = [{ key: null, icon: '★', title: 'All messages', sub: `${state.messages.size} messages` }, ...state.convos.map((c) => ({ key: c.key, icon: c.kind === 'channel' ? '#' : '↔', title: convoTitle(c), sub: c.last ? `${c.last.from}: ${c.last.body}` : `${c.members?.length ?? 0} members · no messages yet`, count: c.count }))];
+  $('convo-list').replaceChildren(el('button', { class: 'new-chat-btn', type: 'button', onclick: openNewChat }, '+ New chat'), ...items.map((it) => el('button', { class: 'convo', role: 'option', 'aria-selected': String(state.selected === it.key), onclick: () => { state.selected = it.key; renderConvoList(); renderThread(); } },
     el('span', { class: 'icon', 'aria-hidden': 'true' }, it.icon),
     el('span', { class: 'text' },
       el('span', { class: 'title' }, el('span', {}, it.title), it.count ? el('span', { class: 'count' }, it.count) : null),
@@ -582,13 +615,67 @@ function renderConvoList() {
 function renderThread() {
   const c = state.convos.find((x) => x.key === state.selected);
   $('thread-title').textContent = c ? convoTitle(c) : 'All messages';
-  $('thread-sub').textContent = c ? (c.kind === 'channel' ? `channel · ${c.participants.length} participants` : 'direct conversation') : 'every conversation on the hub';
+  $('thread-sub').textContent = c ? (c.kind === 'channel' ? `chat · ${c.members?.length ?? 0} members` : 'direct conversation') : 'every conversation on the hub';
+  renderMembers();
   const msgs = [...state.messages.values()].filter((m) => state.selected === null || convoKey(m) === state.selected);
   const body = $('thread-body');
   body.replaceChildren(...(msgs.length ? msgs.map((m) => msgView(m)) : [emptyState('empty-conversations', 'No messages here yet', 'Start the conversation below, or wait for the agents to say hello.')]));
   body.scrollTop = body.scrollHeight;
   renderComposeTargets();
 }
+/** The members of the open chat, each with a button to remove them, and a picker to add more. */
+function renderMembers() {
+  const box = $('thread-members');
+  const c = state.convos.find((x) => x.key === state.selected);
+  if (!c || c.kind !== 'channel') return void (box.hidden = true);
+  box.hidden = false;
+  const members = c.members ?? [];
+  const others = state.agents.filter((a) => !a.disabled && a.kind !== 'a2a' && !members.includes(a.name));
+  const pick = el('select', { 'aria-label': 'Agent to add' }, ...others.map((a) => el('option', { value: a.name }, a.name)));
+  box.replaceChildren(
+    ...(members.length ? members.map((n) => {
+      const a = agentNamed(n);
+      return el('span', { class: 'member', title: a?.online ? `${n} · online` : `${n} · offline` },
+        el('span', { class: 'avatar-wrap' }, avatar(n), el('span', { class: 'dot' + (a?.online ? ' on' : ''), 'aria-hidden': 'true' })), el('span', {}, n),
+        el('button', { class: 'remove', type: 'button', title: `Remove ${n} from ${c.key}`, 'aria-label': `Remove ${n} from ${c.key}`, onclick: () => removeMember(c.key, n) }, '×'));
+    }) : [el('span', { class: 'muted small' }, 'No agents in this chat.')]),
+    others.length ? el('span', { class: 'add-member' }, pick, el('button', { type: 'button', class: 'ghost', onclick: () => addMember(c.key, pick.value) }, '+ Add')) : null);
+}
+async function removeMember(channel, name) {
+  if (!confirm(`Remove ${name} from ${channel}? It stops receiving this chat's messages and can't post in it until you add it back.`)) return;
+  try { await api(`/api/chats/${channel.slice(1)}/members/${encodeURIComponent(name)}`, { method: 'DELETE' }); await refresh(); renderThread(); } catch (err) { alert(err.message); }
+}
+async function addMember(channel, name) {
+  if (!name) return;
+  try { await api(`/api/chats/${channel.slice(1)}/members`, { method: 'POST', body: JSON.stringify({ name }) }); await refresh(); renderThread(); } catch (err) { alert(err.message); }
+}
+function openNewChat() {
+  $('nc-error').textContent = '';
+  $('new-chat-form').reset();
+  const agents = state.agents.filter((a) => !a.disabled && a.kind !== 'a2a').sort((a, b) => (b.online - a.online) || a.name.localeCompare(b.name));
+  $('nc-agents').replaceChildren(...(agents.length ? agents.map((a) => el('label', { class: 'pick' },
+    el('input', { type: 'checkbox', value: a.name, name: 'nc-agent' }),
+    el('span', { class: 'avatar-wrap' }, avatar(a.name), el('span', { class: 'dot' + (a.online ? ' on' : '') })),
+    el('span', {}, el('strong', {}, a.name), el('div', { class: 'muted small' }, a.online ? 'online' : statusText(a))))) : [el('div', { class: 'muted small' }, 'No agents yet: add one on the "Add agent" tab.')]));
+  $('new-chat').showModal();
+  $('nc-name').focus();
+}
+$('nc-cancel').addEventListener('click', () => $('new-chat').close());
+$('new-chat-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  $('nc-error').textContent = '';
+  const members = [...document.querySelectorAll('input[name=nc-agent]:checked')].map((i) => i.value);
+  if (!members.length) return void ($('nc-error').textContent = 'Choose at least one agent.');
+  try {
+    const r = await api('/api/chats', { method: 'POST', body: JSON.stringify({ name: $('nc-name').value.trim(), members }) });
+    $('new-chat').close();
+    await refresh();
+    state.selected = r.channel;
+    renderConvoList();
+    renderThread();
+    $('compose-body').focus();
+  } catch (err) { $('nc-error').textContent = err.message; }
+});
 function appendToThread(m) {
   const body = $('thread-body');
   const atBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 60;

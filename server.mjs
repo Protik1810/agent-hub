@@ -14,7 +14,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
-const VERSION = '1.6.0';
+const VERSION = '1.7.0';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const HOST = process.env.HUB_HOST ?? '127.0.0.1';
 const PORT = Number(process.env.HUB_PORT ?? 7700);
@@ -83,7 +83,9 @@ function isOnline(name) {
 }
 
 // ---------- messages ----------
-const channelsOf = (name) => (name === 'admin' ? null : ['#general', ...(db.agents[name]?.channels ?? [])]);
+const channelsOf = (name) => (name === 'admin' ? null : [...(db.agents[name]?.removedFrom?.includes('#general') ? [] : ['#general']), ...(db.agents[name]?.channels ?? [])]);
+/** The (enabled, local) agents in a channel. */
+const membersOf = (channel) => Object.entries(db.agents).filter(([n, a]) => !a.disabled && a.kind !== 'a2a' && channelsOf(n).includes(channel)).map(([n]) => n).sort();
 /** Can `name` see message `m`? The admin sees everything. */
 function visible(name, m) {
   if (name === 'admin') return true;
@@ -119,6 +121,7 @@ function post(from, { to, body, reply_to, kind }) {
     throw httpError(400, `unknown recipient "${to}" (an agent name, "admin", or a #channel)`);
   }
   if (to === from) throw httpError(400, 'you cannot send a message to yourself');
+  if (db.agents[from]?.removedFrom?.includes(to)) throw httpError(403, `the admin removed you from ${to}`);
   if (typeof body !== 'string' || !body.trim()) throw httpError(400, 'body must be non-empty text');
   if (body.length > MAX_BODY) throw httpError(413, `body is longer than ${MAX_BODY} characters`);
   if (reply_to !== undefined && reply_to !== null && !db.messages.some((m) => m.id === reply_to)) throw httpError(400, 'reply_to is not a known message id');
@@ -210,6 +213,7 @@ fs.mkdirSync(IMAGES, { recursive: true });
 fs.mkdirSync(CATALOG, { recursive: true });
 db.images ??= {};
 db.catalog ??= {};
+db.chats ??= {}; // group chats the admin started: { '#name': { created, by } }
 db.receiptsFrom ??= db.nextId; // read receipts exist from this message id on
 const MAX_IMAGE = 1024 * 1024;
 const IMAGE_RATE = 30; // shared images per agent per hour
@@ -306,9 +310,14 @@ route('GET', '/api/conversations', ({ me }) => {
     c.last = m;
     byKey.set(key, c);
   }
+  // chats the admin created show up before anyone has written in them
+  for (const [key, chat] of Object.entries(db.chats)) {
+    if (byKey.has(key) || !(me.admin || channelsOf(me.name).includes(key))) continue;
+    byKey.set(key, { key, kind: 'channel', participants: new Set(), count: 0, last: null, created: chat.created });
+  }
   const conversations = [...byKey.values()]
-    .map((c) => ({ ...c, participants: [...c.participants].sort() }))
-    .sort((a, b) => b.last.id - a.last.id);
+    .map((c) => ({ ...c, participants: [...c.participants].sort(), ...(c.kind === 'channel' ? { members: membersOf(c.key) } : {}) }))
+    .sort((a, b) => (b.last?.ts ?? b.created ?? '').localeCompare(a.last?.ts ?? a.created ?? ''));
   return { conversations };
 });
 
@@ -424,11 +433,59 @@ route('PATCH', '/api/me', async ({ me, req }) => {
   return publicAgent(me.name, db.agents[me.name]);
 });
 
+// ---------- chats: the admin starts group chats and adds or removes their members ----------
+function addMember(channel, name) {
+  const a = db.agents[name];
+  if (!a || a.disabled) throw httpError(404, `no such agent "${name}"`);
+  if (a.kind === 'a2a') throw httpError(400, `${name} is a remote A2A agent: message it directly instead`);
+  a.removedFrom = (a.removedFrom ?? []).filter((c) => c !== channel);
+  if (channel !== '#general') a.channels = [...new Set([...(a.channels ?? []), channel])];
+}
+route('POST', '/api/chats', async ({ me, req }) => {
+  if (!me.admin) throw httpError(403, 'only the admin can start chats');
+  const { name, members } = await readJson(req);
+  const bare = String(name ?? '').replace(/^#/, '').trim().toLowerCase();
+  if (!NAME.test(bare)) throw httpError(400, 'chat names are 1-32 characters: a-z, 0-9, - or _');
+  const channel = `#${bare}`;
+  if (channel === '#general' || db.chats[channel] || db.messages.some((m) => m.to === channel)) throw httpError(409, `${channel} already exists`);
+  const list = [...new Set(Array.isArray(members) ? members : [])];
+  if (!list.length) throw httpError(400, 'choose at least one agent');
+  for (const n of list) if (!db.agents[n] || db.agents[n].disabled || db.agents[n].kind === 'a2a') throw httpError(400, `"${n}" can't join a chat`);
+  db.chats[channel] = { created: new Date().toISOString(), by: me.name };
+  for (const n of list) addMember(channel, n);
+  save();
+  post('hub', { to: channel, kind: 'system', body: `The admin started ${channel} with ${list.map((n) => '@' + n).join(', ')}. Everything posted here is visible to the members of this chat and the admin.` });
+  return { channel, members: membersOf(channel) };
+});
+route('POST', '/api/chats/([a-z0-9_-]+)/members', async ({ me, req, params }) => {
+  if (!me.admin) throw httpError(403, 'only the admin can add members');
+  const channel = `#${params[0]}`;
+  const { name } = await readJson(req);
+  if (membersOf(channel).includes(name)) throw httpError(409, `${name} is already in ${channel}`);
+  addMember(channel, name);
+  save();
+  post('hub', { to: channel, kind: 'system', body: `The admin added @${name} to ${channel}.` });
+  return { channel, members: membersOf(channel) };
+});
+route('DELETE', '/api/chats/([a-z0-9_-]+)/members/([a-z0-9_-]+)', ({ me, params }) => {
+  if (!me.admin) throw httpError(403, 'only the admin can remove members');
+  const [channel, name] = [`#${params[0]}`, params[1]];
+  const a = db.agents[name];
+  if (!a || !membersOf(channel).includes(name)) throw httpError(404, `${name} is not in ${channel}`);
+  a.channels = (a.channels ?? []).filter((c) => c !== channel);
+  a.removedFrom = [...new Set([...(a.removedFrom ?? []), channel])];
+  save();
+  post('hub', { to: channel, kind: 'system', body: `The admin removed ${name} from ${channel}.` });
+  post('hub', { to: name, kind: 'system', body: `The admin removed you from ${channel}: you no longer receive its messages. Please stop posting there.` });
+  return { channel, members: membersOf(channel) };
+});
+
 route('POST', '/api/channels/([a-z0-9_-]+)/(join|leave)', ({ me, params }) => {
   if (me.admin) return { ok: true, note: 'the admin sees every channel' };
   const [channel, action] = [`#${params[0]}`, params[1]];
   const a = db.agents[me.name];
   if (channel === '#general') throw httpError(400, 'everyone is in #general');
+  if (action === 'join' && a.removedFrom?.includes(channel)) throw httpError(403, `the admin removed you from ${channel}; ask the admin to add you back`);
   a.channels = action === 'join' ? [...new Set([...a.channels, channel])] : a.channels.filter((c) => c !== channel);
   save();
   return { channels: channelsOf(me.name) };

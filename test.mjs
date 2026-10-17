@@ -285,6 +285,38 @@ try {
     assert.ok(both.find((m) => m.id === toAdmin.id).seen.admin);
     assert.ok((await call(ADMIN, 'GET', '/api/stats')).data.receiptsFrom >= 1);
   });
+  await check('chats: the admin starts a group chat, adds and removes members', async () => {
+    const cat = (await call(ADMIN, 'POST', '/api/agents', { name: 'cat', kind: 'http' })).data.token;
+    const dan = (await call(ADMIN, 'POST', '/api/agents', { name: 'dan', kind: 'http' })).data.token;
+    const eli = (await call(ADMIN, 'POST', '/api/agents', { name: 'eli', kind: 'http' })).data.token;
+    assert.equal((await call(cat, 'POST', '/api/chats', { name: 'nope', members: ['dan'] })).status, 403);
+    assert.equal((await call(ADMIN, 'POST', '/api/chats', { name: 'empty', members: [] })).status, 400);
+    const made = await call(ADMIN, 'POST', '/api/chats', { name: 'design-review', members: ['cat', 'dan'] });
+    assert.equal(made.status, 200);
+    assert.deepEqual(made.data.members, ['cat', 'dan']);
+    assert.equal((await call(ADMIN, 'POST', '/api/chats', { name: 'design-review', members: ['cat'] })).status, 409);
+    // members see the chat (and the hub's announcement); others don't
+    const convo = (await call(cat, 'GET', '/api/conversations')).data.conversations.find((c) => c.key === '#design-review');
+    assert.deepEqual(convo.members, ['cat', 'dan']);
+    assert(!(await call(eli, 'GET', '/api/conversations')).data.conversations.some((c) => c.key === '#design-review'));
+    const hello = (await call(dan, 'POST', '/api/messages', { to: '#design-review', body: 'hi cat' })).data;
+    assert((await call(cat, 'GET', `/api/messages?since=${hello.id - 1}`)).data.messages.some((m) => m.id === hello.id));
+    // add, then remove
+    assert.deepEqual((await call(ADMIN, 'POST', '/api/chats/design-review/members', { name: 'eli' })).data.members, ['cat', 'dan', 'eli']);
+    const removed = await call(ADMIN, 'DELETE', '/api/chats/design-review/members/dan');
+    assert.deepEqual(removed.data.members, ['cat', 'eli']);
+    const after = (await call(cat, 'POST', '/api/messages', { to: '#design-review', body: 'dan is gone' })).data;
+    assert(!(await call(dan, 'GET', `/api/messages?since=${after.id - 1}`)).data.messages.some((m) => m.id === after.id), 'a removed member stops receiving the chat');
+    assert.equal((await call(dan, 'POST', '/api/messages', { to: '#design-review', body: 'still here?' })).status, 403);
+    assert.equal((await call(dan, 'POST', '/api/channels/design-review/join')).status, 403);
+    assert((await call(dan, 'GET', `/api/messages?since=${hello.id}`)).data.messages.some((m) => m.from === 'hub' && m.to === 'dan' && m.body.includes('removed you')));
+    // even #general: removal sticks until the admin adds the agent back
+    await call(ADMIN, 'DELETE', '/api/chats/general/members/eli');
+    const g = (await call(cat, 'POST', '/api/messages', { to: '#general', body: 'eli cannot see this' })).data;
+    assert(!(await call(eli, 'GET', `/api/messages?since=${g.id - 1}`)).data.messages.some((m) => m.id === g.id));
+    await call(ADMIN, 'POST', '/api/chats/general/members', { name: 'eli' });
+    assert((await call(ADMIN, 'GET', '/api/conversations')).data.conversations.find((c) => c.key === '#general').members.includes('eli'));
+  });
   await check('presence: an agent waiting for messages counts as connected and online', async () => {
     const waiting = call(hades, 'GET', '/api/messages?since=999999&wait=3');
     await new Promise((r) => setTimeout(r, 300));
