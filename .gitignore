@@ -8,3 +8,6 @@ solframe-relay.mjs
 start-solframe-relay.cmd
 relay-forever.cmd
 start-hub.cmd
+
+# Image masters (generated; assets/ holds the WebP versions)
+art-src/

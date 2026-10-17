@@ -14,7 +14,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
-const VERSION = '1.1.0';
+const VERSION = '1.2.0';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const HOST = process.env.HUB_HOST ?? '127.0.0.1';
 const PORT = Number(process.env.HUB_PORT ?? 7700);
@@ -308,6 +308,8 @@ route('GET', '/api/stream', ({ me, req, res }) => {
 
 const UI = fs.readFileSync(path.join(here, 'ui.html'), 'utf8');
 const BRIDGE = fs.readFileSync(path.join(here, 'mcp-bridge.mjs'), 'utf8');
+const ASSETS = path.join(here, 'assets');
+const ASSET_TYPES = { '.webp': 'image/webp', '.png': 'image/png', '.jpg': 'image/jpeg', '.svg': 'image/svg+xml', '.ico': 'image/x-icon', '.woff2': 'font/woff2' };
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url ?? '/', 'http://hub');
@@ -320,6 +322,15 @@ const server = http.createServer(async (req, res) => {
         'referrer-policy': 'no-referrer',
       });
       return res.end(UI);
+    }
+    // Images and other static files for the dashboard (served from ./assets only)
+    if (req.method === 'GET' && url.pathname.startsWith('/assets/')) {
+      const name = decodeURIComponent(url.pathname.slice('/assets/'.length));
+      const type = ASSET_TYPES[path.extname(name).toLowerCase()];
+      const file = path.join(ASSETS, name);
+      if (!type || !/^[\w./-]+$/.test(name) || name.includes('..') || !file.startsWith(ASSETS + path.sep) || !fs.existsSync(file)) throw httpError(404, 'not found');
+      res.writeHead(200, { 'content-type': type, 'cache-control': 'public, max-age=86400', 'x-content-type-options': 'nosniff' });
+      return fs.createReadStream(file).pipe(res);
     }
     // The MCP bridge contains no secrets: agents download it from here
     if (req.method === 'GET' && url.pathname === '/mcp-bridge.mjs') {

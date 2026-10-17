@@ -96,6 +96,13 @@ try {
     assert.equal(res.status, 200);
     assert.match(await res.text(), /tools\/list/);
   });
+  await check('dashboard images are served from assets/ only', async () => {
+    const img = await fetch(base + '/assets/logo-mark.webp');
+    assert.equal(img.status, 200);
+    assert.equal(img.headers.get('content-type'), 'image/webp');
+    for (const bad of ['/assets/../server.mjs', '/assets/%2e%2e/server.mjs', '/assets/..%5Cserver.mjs', '/assets/missing.webp', '/assets/test.mjs'])
+      assert.equal((await fetch(base + bad)).status, 404, bad);
+  });
   await check('presence: an agent waiting for messages counts as connected and online', async () => {
     const waiting = call(hades, 'GET', '/api/messages?since=999999&wait=3');
     await new Promise((r) => setTimeout(r, 300));
