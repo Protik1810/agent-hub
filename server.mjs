@@ -1218,7 +1218,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/index.html')) {
       res.writeHead(200, {
         'content-type': 'text/html; charset=utf-8',
-        'content-security-policy': "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:",
+        'content-security-policy': "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; worker-src 'self'; manifest-src 'self'; connect-src 'self'; img-src 'self' data:",
         'x-frame-options': 'DENY',
         'referrer-policy': 'no-referrer',
       });

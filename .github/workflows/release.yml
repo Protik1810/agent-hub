@@ -49,7 +49,9 @@ jobs:
         working-directory: desktop/dist/linux-unpacked
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq xvfb > /dev/null
-          export HOME="$(mktemp -d)"
+          # Electron finds its folders through XDG variables (or the account's real home), not $HOME
+          export HOME="$(mktemp -d)" XDG_CONFIG_HOME="$(mktemp -d)"
+          mkdir -p "$XDG_CONFIG_HOME/Agent Hub" && echo '{"port":7791}' > "$XDG_CONFIG_HOME/Agent Hub/settings.json"
           mkdir -p "$HOME/.config/Agent Hub" && echo '{"port":7791}' > "$HOME/.config/Agent Hub/settings.json"
           export ELECTRON_ENABLE_LOGGING=1
           xvfb-run -a ./agent-hub --no-sandbox > "$RUNNER_TEMP/app.log" 2>&1 &
@@ -59,14 +61,15 @@ jobs:
             sleep 1
           done
           echo "--- app output"; cat "$RUNNER_TEMP/app.log" || true
-          echo "--- hub log"; cat "$HOME/.config/Agent Hub/logs/hub.log" 2>/dev/null || find "$HOME" -name hub.log -exec cat {} \; || true
-          echo "--- files"; find "$HOME" -not -path '*/.cache/*' -not -path '*Cache*' -not -path '*/.local/share/pki*' | head -120
+          echo "--- hub log"; cat "$XDG_CONFIG_HOME/Agent Hub/logs/hub.log" || true
+          echo "--- files"; find "$HOME" "$XDG_CONFIG_HOME" -maxdepth 3 -not -path '*Cache*' | head -60
           echo "--- listening"; ss -ltnp 2>/dev/null | head -20
           echo "--- processes"; ps -ef | grep -i "agent-hub\|server.mjs" | grep -v grep | cut -c1-300
           test -n "$ok"
           curl -sf http://127.0.0.1:7791/api/setup | grep -q '"canSignUpHere":true'
           curl -sf -o /dev/null http://127.0.0.1:7791/
           test -f "$HOME/Documents/Agent Hub/README.txt" || test -f "$HOME/Agent Hub/README.txt"
+          test -f "$XDG_CONFIG_HOME/Agent Hub/hub/users.db"
           echo "the app started, the hub answered, and the chat history folder exists"
           pkill -f agent-hub || true
       - uses: actions/upload-artifact@v4
