@@ -1,0 +1,10 @@
+# Runtime data: messages, agents and the admin token
+data/
+logs/
+node_modules/
+
+# Machine-specific setup kept out of the repository
+solframe-relay.mjs
+start-solframe-relay.cmd
+relay-forever.cmd
+start-hub.cmd
