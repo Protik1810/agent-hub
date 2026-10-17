@@ -107,6 +107,16 @@
   .msg .author { font-weight: 600; color: var(--text); font-size: 13px; }
   .msg .to { color: var(--muted); }
   .msg .body { white-space: pre-wrap; word-break: break-word; }
+  .receipt { display: flex; align-items: center; justify-content: flex-end; gap: 6px; margin-top: 6px; font-size: 11px; color: var(--muted); }
+  .receipt .ticks { font-weight: 700; letter-spacing: -2px; padding-right: 2px; }
+  .receipt.all .ticks { color: var(--accent); }
+  .receipt.none .ticks { letter-spacing: 0; }
+  .receipt .seers { display: flex; padding-left: 4px; }
+  .receipt .seers .avatar { width: 16px; height: 16px; border-radius: 50%; margin-left: -4px; border: 1.5px solid var(--panel); font-size: 9px; }
+  .receipt .waiting { color: var(--warn); }
+  .catalog-more { margin-top: 12px; }
+  .catalog-more > summary { cursor: pointer; color: var(--accent); font-size: 13px; }
+  .product .users { font-size: 12px; color: var(--muted); }
   .shots { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
   .shots a { display: block; border-radius: var(--radius-sm); overflow: hidden; border: 1px solid var(--line); background: var(--art-bg); }
   .shots img { display: block; max-width: 220px; max-height: 160px; object-fit: contain; }
@@ -262,9 +272,13 @@
       </table>
     </div>
     <div class="card" style="margin-top:16px">
-      <h2>Known agents</h2>
-      <p class="muted small">Pictures for agent products (Claude Code, Codex, Hermes...). An agent added with a product starts with its picture. Logos belong to their makers: they stay on this hub and are not part of the Agent Hub repository.</p>
+      <h2>Agent pictures in use</h2>
+      <p class="muted small">Known-agent pictures your agents use. Logos belong to their makers: they stay on this hub and are not part of the Agent Hub repository.</p>
       <div class="gallery" id="catalog"></div>
+      <details class="catalog-more" id="catalog-more">
+      <summary id="catalog-more-label">All known agents</summary>
+      <p class="muted small">Pictures for agent products (Claude Code, Codex, Hermes...). An agent added with a product starts with its picture.</p>
+      <div class="gallery" id="catalog-rest"></div>
       <form class="catalog-form" id="catalog-form">
         <div><label for="c-id">Id</label><input id="c-id" placeholder="claude-code" pattern="[a-z0-9][a-z0-9\-]{0,39}" required></div>
         <div><label for="c-name">Name</label><input id="c-name" placeholder="Claude Code" required></div>
@@ -272,6 +286,7 @@
         <div><label for="c-file">Picture</label><input id="c-file" type="file" accept="image/png,image/jpeg,image/webp"></div>
         <div><button>Add or update</button> <span id="c-error" class="err small"></span></div>
       </form>
+      </details>
     </div>
   </section>
 
@@ -446,7 +461,8 @@ async function openStream() {
         const chunk = buf.slice(0, i);
         buf = buf.slice(i + 2);
         const line = chunk.split('\n').find((l) => l.startsWith('data: '));
-        if (line) addMessage(JSON.parse(line.slice(6)));
+        const event = chunk.split('\n').find((l) => l.startsWith('event: '))?.slice(7);
+        if (line) (event === 'seen' ? onSeen : addMessage)(JSON.parse(line.slice(6)));
       }
     }
   } catch {}
@@ -460,6 +476,8 @@ async function openStream() {
 async function refresh() {
   const [agents, stats, convos, catalog] = await Promise.all([api('/api/agents'), api('/api/stats'), api('/api/conversations'), api('/api/catalog')]);
   state.catalog = catalog.catalog;
+  const firstLoad = state.receiptsSince === undefined;
+  state.receiptsSince = stats.receiptsFrom ?? 0;
   state.agents = agents.agents;
   state.convos = convos.conversations;
   renderCatalog();
@@ -473,11 +491,19 @@ async function refresh() {
   renderOverviewAgents();
   renderConvoList();
   renderComposeTargets();
+  if (firstLoad) { renderLatest(); if (!$('conversations').hidden) renderThread(); }
 }
 
 // ---------- overview ----------
+function unseenFor(a) {
+  // messages addressed to this agent (directly or in its channels) that it hasn't picked up after 2 minutes
+  const cutoff = Date.now() - 120_000;
+  return [...state.messages.values()].filter((m) => m.from !== a.name && m.from !== 'hub' && Date.parse(m.ts) < cutoff && !m.seen?.[a.name] && audienceOf(m).includes(a.name) && state.receiptsSince !== undefined && m.id >= state.receiptsSince).length;
+}
 function statusText(a) {
-  return a.online ? (a.connected ? 'connected now' : `active ${ago(a.lastSeen)}`) : `last seen ${ago(a.lastSeen)}`;
+  const base = a.online ? (a.connected ? 'connected now' : `active ${ago(a.lastSeen)}`) : `last seen ${ago(a.lastSeen)}`;
+  const unseen = a.kind === 'a2a' ? 0 : unseenFor(a);
+  return unseen ? `${base} · ${unseen} message${unseen === 1 ? '' : 's'} not picked up` : base;
 }
 function renderOverviewAgents() {
   const active = state.agents.filter((a) => !a.disabled).sort((a, b) => (b.online - a.online) || String(b.lastSeen).localeCompare(String(a.lastSeen)));
@@ -488,6 +514,42 @@ function renderOverviewAgents() {
       el('div', { class: 'muted small' }, a.description || 'No description'),
       el('div', { class: 'muted small' }, statusText(a))))) : [emptyState('empty-agents', 'No agents yet', 'Add your first agent on the "Add agent" tab.')]));
 }
+/** Who should see a message: its recipient, or every member of its channel (as the hub knows them now) except the sender. */
+function audienceOf(m) {
+  if (!m.to.startsWith('#')) return [m.to];
+  return state.agents.filter((a) => !a.disabled && a.kind !== 'a2a' && a.name !== m.from && (m.to === '#general' || a.channels?.includes(m.to)) && (!a.created || a.created <= m.ts)).map((a) => a.name);
+}
+/** "Sent / Seen by" line under a message, like a chat app: grey tick = sent, cyan double tick = seen by everyone. */
+const seenAt = (ts) => (new Date(ts).toDateString() === new Date().toDateString() ? new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : time(ts));
+function receiptView(m) {
+  if (m.from === 'hub' || state.receiptsSince === undefined || m.id < state.receiptsSince) return null; // older messages have no receipts
+  const seen = m.seen ?? {};
+  const audience = audienceOf(m);
+  const names = Object.keys(seen).sort((a, b) => seen[a].localeCompare(seen[b]));
+  const missing = audience.filter((n) => !seen[n]);
+  if (!audience.length && !names.length) return null;
+  const all = audience.length > 0 && !missing.length;
+  const offline = missing.filter((n) => n !== 'admin' && agentNamed(n) && !agentNamed(n).online);
+  let text;
+  if (!names.length) text = audience.length === 1 ? `Sent · not seen by ${audience[0]} yet` : `Sent · not seen yet`;
+  else if (!m.to.startsWith('#')) text = all ? `Seen ${seenAt(seen[m.to])}` : 'Sent';
+  else text = all ? `Seen by everyone` : `Seen by ${names.length} of ${audience.length}`;
+  const title = [...names.map((n) => `${n}: seen ${seenAt(seen[n])}`), ...(missing.length ? [`Not yet: ${missing.join(', ')}`] : [])].join('\n');
+  return el('div', { class: 'receipt ' + (all ? 'all' : names.length ? 'some' : 'none'), title, 'data-receipt': m.id },
+    m.to.startsWith('#') && names.length ? el('span', { class: 'seers' }, ...names.slice(0, 6).map((n) => avatar(n))) : null,
+    el('span', {}, text),
+    offline.length && !all ? el('span', { class: 'waiting' }, `· ${offline.join(', ')} offline`) : null,
+    el('span', { class: 'ticks', 'aria-hidden': 'true' }, names.length ? '✓✓' : '✓'));
+}
+function onSeen({ id, name, ts }) {
+  const m = state.messages.get(id);
+  if (!m) return;
+  (m.seen ??= {})[name] = ts;
+  for (const old of document.querySelectorAll(`[data-receipt="${id}"]`)) {
+    const fresh = receiptView(m);
+    if (fresh) old.replaceWith(fresh);
+  }
+}
 function msgView(m, fresh = false) {
   const quoted = m.reply_to ? state.messages.get(m.reply_to) : null;
   return el('div', { class: 'msg' + (m.from === 'admin' ? ' admin' : '') + (fresh ? ' new' : '') },
@@ -496,7 +558,8 @@ function msgView(m, fresh = false) {
       el('div', { class: 'meta' }, el('span', { class: 'author' }, m.from), badge(agentNamed(m.from)?.kind), el('span', { class: 'to' }, `→ ${m.to}`), el('span', {}, time(m.ts)), el('span', {}, `#${m.id}`)),
       m.reply_to ? el('div', { class: 'reply-quote' }, quoted ? `↩ ${quoted.from}: ${quoted.body}` : `↩ reply to #${m.reply_to}`) : null,
       el('div', { class: 'body' }, m.body),
-      shots(m.body)));
+      shots(m.body),
+      receiptView(m)));
 }
 function shots(body) {
   const links = [...new Set(String(body).match(/\/images\/[0-9a-f]{16}\.(?:png|jpg|webp)/g) ?? [])].slice(0, 6);
@@ -589,11 +652,19 @@ function renderCatalog() {
   const current = sel.value;
   sel.replaceChildren(el('option', { value: '' }, 'Other / not listed'), ...state.catalog.map((c) => el('option', { value: c.id }, c.maker ? `${c.name} (${c.maker})` : c.name)));
   if (state.catalog.some((c) => c.id === current)) sel.value = current;
-  $('catalog').replaceChildren(...(state.catalog.length ? state.catalog.map((c) => el('div', { class: 'product' },
+  // An agent uses a known picture when it was given that picture (or was added with that product and kept it)
+  const usersOf = (c) => state.agents.filter((a) => !a.disabled && a.avatar && (a.avatarFrom === c.id || (!a.avatarFrom && a.product === c.id))).map((a) => a.name);
+  const card = (c, users) => el('div', { class: 'product' },
     el('img', { src: c.image, alt: '', loading: 'lazy' }), el('strong', {}, c.name), el('span', { class: 'muted small' }, c.maker || c.id),
+    users.length ? el('span', { class: 'users' }, `used by ${users.join(', ')}`) : null,
     el('div', { class: 'row' },
       el('button', { class: 'ghost', title: 'Give an agent this picture', onclick: () => applyProduct(c) }, 'Use for…'),
-      el('button', { class: 'danger', onclick: () => removeProduct(c) }, 'Remove')))) : [el('div', { class: 'muted small' }, 'No known agents yet: add one below.')]));
+      users.length ? null : el('button', { class: 'danger', onclick: () => removeProduct(c) }, 'Remove')));
+  const used = state.catalog.map((c) => [c, usersOf(c)]).filter(([, u]) => u.length);
+  const rest = state.catalog.filter((c) => !used.some(([u]) => u.id === c.id));
+  $('catalog').replaceChildren(...(used.length ? used.map(([c, u]) => card(c, u)) : [el('div', { class: 'muted small' }, 'No agent uses a known-agent picture yet.')]));
+  $('catalog-rest').replaceChildren(...(rest.length ? rest.map((c) => card(c, [])) : [el('div', { class: 'muted small' }, state.catalog.length ? 'Every known agent picture is in use.' : 'No known agents yet: add one below.')]));
+  $('catalog-more-label').textContent = `All known agents (${state.catalog.length}${rest.length ? `, ${rest.length} not in use` : ''})`;
 }
 async function applyProduct(c) {
   const name = prompt(`Give which agent the ${c.name} picture?`, '');

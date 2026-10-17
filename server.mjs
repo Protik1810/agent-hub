@@ -14,7 +14,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
-const VERSION = '1.5.1';
+const VERSION = '1.6.0';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const HOST = process.env.HUB_HOST ?? '127.0.0.1';
 const PORT = Number(process.env.HUB_PORT ?? 7700);
@@ -93,7 +93,25 @@ function visible(name, m) {
 /** A message's conversation: its channel, or the pair of names in a direct conversation ("ada|grace"). */
 const conversationOf = (m) => (m.to.startsWith('#') ? m.to : [m.from, m.to].sort().join('|'));
 
-const waiters = new Set(); // long-poll and stream listeners: { name, push(message) }
+const waiters = new Set(); // long-poll and stream listeners: { name, push(message), seen?(receipt) }
+
+/** Read receipts: record that `name` has received these messages (m.seen = { name: time }) and tell the streams. */
+function markSeen(name, messages) {
+  const now = new Date().toISOString();
+  const fresh = [];
+  for (const m of messages) {
+    if (m.from === name || (name === 'admin' && m.to !== 'admin')) continue; // the admin only "reads" what is addressed to it
+    if (m.seen?.[name]) continue;
+    (m.seen ??= {})[name] = now;
+    fresh.push(m);
+  }
+  if (!fresh.length) return;
+  save();
+  for (const m of fresh) {
+    const receipt = { id: m.id, name, ts: now };
+    for (const w of waiters) if (w.seen && visible(w.name, m)) w.seen(receipt);
+  }
+}
 const sent = new Map(); // rate limiting: name -> timestamps
 
 function post(from, { to, body, reply_to, kind }) {
@@ -177,11 +195,11 @@ function avatarFrom(body) {
   if (img.buf.length > MAX_AVATAR) throw httpError(413, `the image is larger than ${MAX_AVATAR / 1024} KB`);
   return img;
 }
-function setAvatar(name, { buf, kind }) {
+function setAvatar(name, { buf, kind }, catalog = null) {
   const a = db.agents[name];
   for (const ext of ['png', 'jpg', 'webp']) fs.rmSync(path.join(AVATARS, `${name}.${ext}`), { force: true });
   fs.writeFileSync(path.join(AVATARS, `${name}.${kind.ext}`), buf);
-  a.avatar = { ext: kind.ext, type: kind.type, updated: Date.now() };
+  a.avatar = { ext: kind.ext, type: kind.type, updated: Date.now(), ...(catalog ? { catalog } : {}) };
   save();
   return publicAgent(name, a);
 }
@@ -192,6 +210,7 @@ fs.mkdirSync(IMAGES, { recursive: true });
 fs.mkdirSync(CATALOG, { recursive: true });
 db.images ??= {};
 db.catalog ??= {};
+db.receiptsFrom ??= db.nextId; // read receipts exist from this message id on
 const MAX_IMAGE = 1024 * 1024;
 const IMAGE_RATE = 30; // shared images per agent per hour
 const uploads = new Map();
@@ -218,6 +237,7 @@ const publicAgent = (name, a) => ({
   sent: a.sent ?? 0,
   disabled: !!a.disabled,
   avatar: a.avatar ? `/avatars/${name}?v=${a.avatar.updated}` : null,
+  avatarFrom: a.avatar?.catalog ?? null, // the known-agent picture it uses, if any
   product: a.product ?? null,
   a2a: a.kind === 'a2a' ? { remote: true, endpoint: a.a2a?.url, agent: a.a2a?.name, skills: a.a2a?.skills ?? [] } : { card: `/a2a/${name}/.well-known/agent-card.json` },
 });
@@ -264,6 +284,7 @@ route('GET', '/api/stats', ({ me }) => {
   const mine = db.messages.filter((m) => visible(me.name, m));
   return {
     agents: agents.length,
+    receiptsFrom: db.receiptsFrom,
     online: agents.filter(([n]) => isOnline(n)).length,
     connected: agents.filter(([n]) => connected(n)).length,
     messages: mine.length,
@@ -309,7 +330,7 @@ route('POST', '/api/agents', async ({ me, req }) => {
     product: product || null,
   };
   // A known product starts with its picture from the catalogue
-  if (product) setAvatar(name, storedImage({ catalog: product }));
+  if (product) setAvatar(name, storedImage({ catalog: product }), product);
   save();
   return { name, token, note: 'Store this token now: it is not shown again.' };
 });
@@ -345,7 +366,8 @@ route('DELETE', '/api/me/avatar', ({ me }) => {
 route('PUT', '/api/agents/([a-z0-9_-]+)/avatar', async ({ me, req, params }) => {
   if (!me.admin) throw httpError(403, 'admin only (agents use PUT /api/me/avatar)');
   if (!db.agents[params[0]]) throw httpError(404, 'no such agent');
-  return setAvatar(params[0], avatarFrom(await readJson(req, MAX_AVATAR * 1.5)));
+  const body = await readJson(req, MAX_AVATAR * 1.5);
+  return setAvatar(params[0], avatarFrom(body), body.image === undefined && body.from === undefined ? body.catalog : null);
 });
 
 // Shared images: any agent can upload one and post its link (images can't travel inside text messages)
@@ -422,7 +444,10 @@ route('GET', '/api/messages', ({ me, url, req }) => {
   const conversation = url.searchParams.get('conversation');
   const matches = (m) => m.id > since && visible(me.name, m) && (!conversation || conversationOf(m) === conversation);
   const found = db.messages.filter(matches).slice(-limit);
-  if (found.length || !wait) return { messages: found };
+  if (found.length || !wait) {
+    markSeen(me.name, found);
+    return { messages: found };
+  }
   return new Promise((resolve) => {
     const w = { name: me.name, push: (m) => matches(m) && done([m]) };
     const timer = setTimeout(() => done([]), wait * 1000);
@@ -433,6 +458,7 @@ route('GET', '/api/messages', ({ me, url, req }) => {
       clearTimeout(timer);
       waiters.delete(w);
       release(me.name);
+      markSeen(me.name, messages);
       resolve({ messages });
     }
     holdOpen(me.name);
@@ -445,7 +471,14 @@ route('GET', '/api/messages', ({ me, url, req }) => {
 route('GET', '/api/stream', ({ me, req, res }) => {
   res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store', connection: 'keep-alive' });
   res.write(': connected\n\n');
-  const w = { name: me.name, push: (m) => res.write(`id: ${m.id}\nevent: message\ndata: ${JSON.stringify(m)}\n\n`) };
+  const w = {
+    name: me.name,
+    push: (m) => {
+      res.write(`id: ${m.id}\nevent: message\ndata: ${JSON.stringify(m)}\n\n`);
+      setImmediate(() => markSeen(me.name, [m]));
+    },
+    seen: (receipt) => res.write(`event: seen\ndata: ${JSON.stringify(receipt)}\n\n`),
+  };
   waiters.add(w);
   holdOpen(me.name);
   const ping = setInterval(() => res.write(': ping\n\n'), 25_000);
@@ -671,7 +704,7 @@ async function registerRemote(name, { url, token, description, product }) {
     product: product || null,
     a2a: { url: endpoint, cardUrl: url, name: String(card.name ?? '').slice(0, 100), skills: (card.skills ?? []).map((k) => String(k?.name ?? k?.id ?? '')).slice(0, 20), streaming: !!card.capabilities?.streaming, ...(token ? { token: String(token) } : {}), contexts: {} },
   };
-  if (product) setAvatar(name, storedImage({ catalog: product }));
+  if (product) setAvatar(name, storedImage({ catalog: product }), product);
   save();
   return { name, a2a: { endpoint, agent: db.agents[name].a2a.name, skills: db.agents[name].a2a.skills } };
 }
@@ -714,6 +747,7 @@ async function forwardA2A(m) {
     if (result?.contextId) remote.contexts[key] = result.contextId;
     a.lastSeen = new Date().toISOString();
     save();
+    markSeen(m.to, [m]);
     post(m.to, { to: m.from, kind: 'a2a', reply_to: m.id, body: a2aText(result) || '(the A2A agent answered without any text)' });
   } catch (e) {
     post('hub', { to: m.from, kind: 'system', reply_to: m.id, body: `Could not reach the remote A2A agent ${m.to}: ${e.message}` });

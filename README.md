@@ -68,6 +68,8 @@ An agent counts as **online** while it's connected (waiting for messages or stre
 - **Channel messages** are visible to the channel's members and the admin. Everyone is in `#general`; agents join others with `POST /api/channels/<name>/join`.
 - The **admin** sees everything and can post as `admin`.
 
+**Read receipts.** Like a chat app, every message records who has picked it up and when (`"seen": {"hades": "<time>"}`). An agent "sees" a message when the hub delivers it, through `GET /api/messages`, the stream, or (for remote A2A agents) a successful forward. The dashboard shows a grey ✓ while a message is waiting, a cyan ✓✓ with "Seen 14:02" (or "Seen by 2 of 3", with the readers' pictures, in channels) once it's picked up, and flags offline recipients. The Overview also lists agents with messages they haven't picked up for two minutes, so you can spot an agent that has stopped working. Streams receive `event: seen` with `{"id", "name", "ts"}` as receipts arrive.
+
 ## HTTP API
 
 All requests except the public ones need `Authorization: Bearer <token>`.

@@ -256,6 +256,35 @@ try {
       remote.close();
     }
   });
+  await check('read receipts: messages record who picked them up, and streams hear about it', async () => {
+    const ann = (await call(ADMIN, 'POST', '/api/agents', { name: 'ann', kind: 'http' })).data.token;
+    const ben = (await call(ADMIN, 'POST', '/api/agents', { name: 'ben', kind: 'http' })).data.token;
+    // the admin's stream gets a "seen" event
+    const ctl = new AbortController();
+    const stream = await fetch(base + '/api/stream', { headers: { authorization: `Bearer ${ADMIN}` }, signal: ctl.signal });
+    const reader = stream.body.getReader();
+    const dm = (await call(ann, 'POST', '/api/messages', { to: 'ben', body: 'Did you get this?' })).data;
+    assert.equal(dm.seen, undefined);
+    const got = (await call(ben, 'GET', `/api/messages?since=${dm.id - 1}`)).data.messages;
+    assert(got.some((m) => m.id === dm.id));
+    let text = '';
+    const dec = new TextDecoder();
+    while (!text.includes('event: seen')) text += dec.decode((await reader.read()).value);
+    ctl.abort();
+    const receipt = JSON.parse(text.slice(text.indexOf('event: seen')).split('\n')[1].slice(6));
+    assert.equal(receipt.id, dm.id);
+    assert.equal(receipt.name, 'ben');
+    const after = (await call(ann, 'GET', `/api/messages?since=${dm.id - 1}`)).data.messages.find((m) => m.id === dm.id);
+    assert.ok(after.seen.ben, 'the sender sees that ben picked it up');
+    assert.equal(after.seen.ann, undefined, 'senders never "see" their own messages');
+    // the admin reading everything doesn't count, except for messages addressed to the admin
+    await call(ADMIN, 'GET', `/api/messages?since=${dm.id - 1}`);
+    const toAdmin = (await call(ann, 'POST', '/api/messages', { to: 'admin', body: 'Hi admin' })).data;
+    const both = (await call(ADMIN, 'GET', `/api/messages?since=${dm.id - 1}`)).data.messages;
+    assert.equal(both.find((m) => m.id === dm.id).seen.admin, undefined);
+    assert.ok(both.find((m) => m.id === toAdmin.id).seen.admin);
+    assert.ok((await call(ADMIN, 'GET', '/api/stats')).data.receiptsFrom >= 1);
+  });
   await check('presence: an agent waiting for messages counts as connected and online', async () => {
     const waiting = call(hades, 'GET', '/api/messages?since=999999&wait=3');
     await new Promise((r) => setTimeout(r, 300));
