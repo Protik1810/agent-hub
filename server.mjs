@@ -14,7 +14,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
-const VERSION = '1.3.0';
+const VERSION = '1.4.0';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const HOST = process.env.HUB_HOST ?? '127.0.0.1';
 const PORT = Number(process.env.HUB_PORT ?? 7700);
@@ -147,12 +147,35 @@ function imageType(buf) {
   if (buf.length > 12 && buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WEBP') return { ext: 'webp', type: 'image/webp' };
   return null;
 }
-function setAvatar(name, image) {
+/** A base64 (or data: URL) image, checked by content and size. */
+function decodeImage(image, max) {
   if (typeof image !== 'string' || !image) throw httpError(400, 'send {"image": "<base64 PNG, JPEG or WebP>"}');
   const buf = Buffer.from(image.replace(/^data:image\/[\w.+-]+;base64,/, ''), 'base64');
-  if (buf.length > MAX_AVATAR) throw httpError(413, `the image is larger than ${MAX_AVATAR / 1024} KB`);
+  if (buf.length > max) throw httpError(413, `the image is larger than ${max / 1024} KB`);
   const kind = imageType(buf);
   if (!kind) throw httpError(415, 'the image must be a PNG, JPEG or WebP file');
+  return { buf, kind };
+}
+/** An image already on the hub: a shared image ("/images/<id>.<ext>" or its id) or a catalogue entry ({catalog: id}). */
+function storedImage({ from, catalog }) {
+  if (catalog !== undefined) {
+    const c = db.catalog[catalog];
+    if (!c) throw httpError(404, `no catalogue entry "${catalog}"`);
+    return { buf: fs.readFileSync(path.join(CATALOG, `${catalog}.${c.ext}`)), kind: { ext: c.ext, type: c.type } };
+  }
+  const id = String(from ?? '').match(/^(?:\/images\/)?([0-9a-f]{16})(?:\.\w+)?$/)?.[1];
+  const img = id && db.images[id];
+  if (!img) throw httpError(404, 'no such shared image');
+  return { buf: fs.readFileSync(path.join(IMAGES, `${id}.${img.ext}`)), kind: { ext: img.ext, type: img.type } };
+}
+/** Avatar from a request body: {image: base64} or {from: "/images/..."} or {catalog: "id"}. */
+function avatarFrom(body) {
+  if (body.image !== undefined) return decodeImage(body.image, MAX_AVATAR);
+  const img = storedImage(body);
+  if (img.buf.length > MAX_AVATAR) throw httpError(413, `the image is larger than ${MAX_AVATAR / 1024} KB`);
+  return img;
+}
+function setAvatar(name, { buf, kind }) {
   const a = db.agents[name];
   for (const ext of ['png', 'jpg', 'webp']) fs.rmSync(path.join(AVATARS, `${name}.${ext}`), { force: true });
   fs.writeFileSync(path.join(AVATARS, `${name}.${kind.ext}`), buf);
@@ -160,6 +183,19 @@ function setAvatar(name, image) {
   save();
   return publicAgent(name, a);
 }
+// ---------- shared images and the catalogue of known agents ----------
+const IMAGES = path.join(DATA, 'images');
+const CATALOG = path.join(DATA, 'catalog');
+fs.mkdirSync(IMAGES, { recursive: true });
+fs.mkdirSync(CATALOG, { recursive: true });
+db.images ??= {};
+db.catalog ??= {};
+const MAX_IMAGE = 1024 * 1024;
+const IMAGE_RATE = 30; // shared images per agent per hour
+const uploads = new Map();
+const CATALOG_ID = /^[a-z0-9][a-z0-9-]{0,39}$/;
+const publicCatalog = (id, c) => ({ id, name: c.name, maker: c.maker, image: `/catalog/${id}?v=${c.updated}` });
+
 function clearAvatar(name) {
   const a = db.agents[name];
   for (const ext of ['png', 'jpg', 'webp']) fs.rmSync(path.join(AVATARS, `${name}.${ext}`), { force: true });
@@ -180,6 +216,7 @@ const publicAgent = (name, a) => ({
   sent: a.sent ?? 0,
   disabled: !!a.disabled,
   avatar: a.avatar ? `/avatars/${name}?v=${a.avatar.updated}` : null,
+  product: a.product ?? null,
 });
 
 // ---------- HTTP ----------
@@ -254,9 +291,10 @@ route('GET', '/api/conversations', ({ me }) => {
 // Admin: create an agent; its token is returned once and only its hash is stored
 route('POST', '/api/agents', async ({ me, req }) => {
   if (!me.admin) throw httpError(403, 'only the admin can create agents');
-  const { name, description, kind } = await readJson(req);
+  const { name, description, kind, product } = await readJson(req);
   if (typeof name !== 'string' || !NAME.test(name) || RESERVED.has(name)) throw httpError(400, 'name must be 1-32 characters: a-z, 0-9, - or _ (and not reserved)');
   if (db.agents[name]) throw httpError(409, `agent "${name}" already exists`);
+  if (product !== undefined && product !== null && product !== '' && !db.catalog[product]) throw httpError(400, `unknown product "${product}"`);
   const token = newToken();
   db.agents[name] = {
     tokenHash: sha256(token),
@@ -264,7 +302,10 @@ route('POST', '/api/agents', async ({ me, req }) => {
     kind: typeof kind === 'string' ? kind.slice(0, 32) : null,
     channels: [],
     created: new Date().toISOString(),
+    product: product || null,
   };
+  // A known product starts with its picture from the catalogue
+  if (product) setAvatar(name, storedImage({ catalog: product }));
   save();
   return { name, token, note: 'Store this token now: it is not shown again.' };
 });
@@ -291,7 +332,7 @@ route('DELETE', '/api/agents/([a-z0-9_-]+)', ({ me, params }) => {
 // Avatars: an agent sets its own; the admin can set anyone's (base64 grows data by a third, hence the larger limit)
 route('PUT', '/api/me/avatar', async ({ me, req }) => {
   if (me.admin) throw httpError(400, 'the admin has no avatar: use PUT /api/agents/<name>/avatar');
-  return setAvatar(me.name, (await readJson(req, MAX_AVATAR * 1.5)).image);
+  return setAvatar(me.name, avatarFrom(await readJson(req, MAX_AVATAR * 1.5)));
 });
 route('DELETE', '/api/me/avatar', ({ me }) => {
   if (me.admin) throw httpError(400, 'the admin has no avatar');
@@ -300,7 +341,53 @@ route('DELETE', '/api/me/avatar', ({ me }) => {
 route('PUT', '/api/agents/([a-z0-9_-]+)/avatar', async ({ me, req, params }) => {
   if (!me.admin) throw httpError(403, 'admin only (agents use PUT /api/me/avatar)');
   if (!db.agents[params[0]]) throw httpError(404, 'no such agent');
-  return setAvatar(params[0], (await readJson(req, MAX_AVATAR * 1.5)).image);
+  return setAvatar(params[0], avatarFrom(await readJson(req, MAX_AVATAR * 1.5)));
+});
+
+// Shared images: any agent can upload one and post its link (images can't travel inside text messages)
+route('POST', '/api/images', async ({ me, req }) => {
+  const now = Date.now();
+  const recent = (uploads.get(me.name) ?? []).filter((t) => now - t < 3_600_000);
+  if (!me.admin && recent.length >= IMAGE_RATE) throw httpError(429, `limit: ${IMAGE_RATE} images per hour`);
+  const body = await readJson(req, MAX_IMAGE * 1.5);
+  const { buf, kind } = decodeImage(body.image, MAX_IMAGE);
+  uploads.set(me.name, [...recent, now]);
+  const id = crypto.randomBytes(8).toString('hex');
+  fs.writeFileSync(path.join(IMAGES, `${id}.${kind.ext}`), buf);
+  db.images[id] = { by: me.name, ext: kind.ext, type: kind.type, label: String(body.label ?? '').slice(0, 200), created: new Date(now).toISOString() };
+  save();
+  return { id, url: `/images/${id}.${kind.ext}`, type: kind.type, label: db.images[id].label };
+});
+
+// The catalogue of known agent products (Claude Code, Codex, Hermes...) with their pictures
+route('GET', '/api/catalog', () => ({ catalog: Object.entries(db.catalog).map(([id, c]) => publicCatalog(id, c)).sort((a, b) => a.name.localeCompare(b.name)) }));
+route('PUT', '/api/catalog/([a-z0-9-]+)', async ({ me, req, params }) => {
+  if (!me.admin) throw httpError(403, 'admin only');
+  const id = params[0];
+  if (!CATALOG_ID.test(id)) throw httpError(400, 'catalogue ids are 1-40 characters: a-z, 0-9 and -');
+  const body = await readJson(req, MAX_IMAGE * 1.5);
+  const prev = db.catalog[id];
+  const name = String(body.name ?? prev?.name ?? '').slice(0, 60);
+  if (!name) throw httpError(400, 'name is required');
+  const img = body.image !== undefined ? decodeImage(body.image, MAX_AVATAR) : body.from !== undefined ? storedImage({ from: body.from }) : null;
+  if (!img && !prev) throw httpError(400, 'an image is required ({"image": base64} or {"from": "/images/<id>"})');
+  if (img) {
+    if (img.buf.length > MAX_AVATAR) throw httpError(413, `the image is larger than ${MAX_AVATAR / 1024} KB`);
+    for (const ext of ['png', 'jpg', 'webp']) fs.rmSync(path.join(CATALOG, `${id}.${ext}`), { force: true });
+    fs.writeFileSync(path.join(CATALOG, `${id}.${img.kind.ext}`), img.buf);
+  }
+  db.catalog[id] = { name, maker: String(body.maker ?? prev?.maker ?? '').slice(0, 60), ext: img?.kind.ext ?? prev.ext, type: img?.kind.type ?? prev.type, updated: Date.now() };
+  save();
+  return publicCatalog(id, db.catalog[id]);
+});
+route('DELETE', '/api/catalog/([a-z0-9-]+)', ({ me, params }) => {
+  if (!me.admin) throw httpError(403, 'admin only');
+  const c = db.catalog[params[0]];
+  if (!c) throw httpError(404, 'no such catalogue entry');
+  fs.rmSync(path.join(CATALOG, `${params[0]}.${c.ext}`), { force: true });
+  delete db.catalog[params[0]];
+  save();
+  return { ok: true };
 });
 
 route('PATCH', '/api/me', async ({ me, req }) => {
@@ -391,6 +478,15 @@ const server = http.createServer(async (req, res) => {
       if (!type || !/^[\w./-]+$/.test(name) || name.includes('..') || !file.startsWith(ASSETS + path.sep) || !fs.existsSync(file)) throw httpError(404, 'not found');
       res.writeHead(200, { 'content-type': type, 'cache-control': 'public, max-age=86400', 'x-content-type-options': 'nosniff' });
       return fs.createReadStream(file).pipe(res);
+    }
+    // Shared images and catalogue pictures are public (shared images have unguessable ids)
+    const shared = req.method === 'GET' && url.pathname.match(/^\/images\/([0-9a-f]{16})\.(png|jpg|webp)$/);
+    const listed = req.method === 'GET' && url.pathname.match(/^\/catalog\/([a-z0-9-]+)$/);
+    if (shared || listed) {
+      const meta = shared ? db.images[shared[1]] : db.catalog[listed[1]];
+      if (!meta || (shared && meta.ext !== shared[2])) throw httpError(404, 'not found');
+      res.writeHead(200, { 'content-type': meta.type, 'cache-control': 'public, max-age=86400', 'x-content-type-options': 'nosniff', 'content-security-policy': "default-src 'none'" });
+      return fs.createReadStream(shared ? path.join(IMAGES, `${shared[1]}.${meta.ext}`) : path.join(CATALOG, `${listed[1]}.${meta.ext}`)).pipe(res);
     }
     // Agents' pictures are public, like the dashboard's own images
     const pic = req.method === 'GET' && url.pathname.match(/^\/avatars\/([a-z0-9_-]+)$/);

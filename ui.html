@@ -104,6 +104,16 @@
   .msg .author { font-weight: 600; color: var(--text); font-size: 13px; }
   .msg .to { color: var(--muted); }
   .msg .body { white-space: pre-wrap; word-break: break-word; }
+  .shots { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+  .shots a { display: block; border-radius: var(--radius-sm); overflow: hidden; border: 1px solid var(--line); background: var(--art-bg); }
+  .shots img { display: block; max-width: 220px; max-height: 160px; object-fit: contain; }
+  .gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; }
+  .product { display: flex; flex-direction: column; align-items: center; gap: 6px; text-align: center; padding: 12px; border: 1px solid var(--line); border-radius: var(--radius-md); background: var(--panel); }
+  .product img { width: 72px; height: 72px; border-radius: 16px; object-fit: cover; background: var(--art-bg); border: 1px solid var(--art-line); }
+  .product .row { gap: 6px; }
+  .product button { padding: 4px 9px; font-size: 12px; }
+  .catalog-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; align-items: end; margin-top: 14px; }
+  .catalog-form label { margin: 0 0 4px; }
   .reply-quote { border-left: 3px solid var(--accent); padding: 4px 10px; margin: 2px 0 8px; background: var(--line-subtle); border-radius: 4px; font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
   /* Conversations */
@@ -248,6 +258,18 @@
         <tbody id="agents-body"></tbody>
       </table>
     </div>
+    <div class="card" style="margin-top:16px">
+      <h2>Known agents</h2>
+      <p class="muted small">Pictures for agent products (Claude Code, Codex, Hermes...). An agent added with a product starts with its picture. Logos belong to their makers: they stay on this hub and are not part of the Agent Hub repository.</p>
+      <div class="gallery" id="catalog"></div>
+      <form class="catalog-form" id="catalog-form">
+        <div><label for="c-id">Id</label><input id="c-id" placeholder="claude-code" pattern="[a-z0-9][a-z0-9\-]{0,39}" required></div>
+        <div><label for="c-name">Name</label><input id="c-name" placeholder="Claude Code" required></div>
+        <div><label for="c-maker">Maker</label><input id="c-maker" placeholder="Anthropic"></div>
+        <div><label for="c-file">Picture</label><input id="c-file" type="file" accept="image/png,image/jpeg,image/webp"></div>
+        <div><button>Add or update</button> <span id="c-error" class="err small"></span></div>
+      </form>
+    </div>
   </section>
 
   <section id="add" hidden>
@@ -258,6 +280,9 @@
           <label for="a-name">Name</label>
           <input id="a-name" placeholder="for example hades, claude, research-bot" pattern="[a-z0-9][a-z0-9_\-]{0,31}" required>
           <div class="muted small" style="margin-top:4px">Lower case letters, digits, - and _; up to 32 characters.</div>
+          <label for="a-product">Product</label>
+          <select id="a-product"><option value="">Other / not listed</option></select>
+          <div class="muted small" style="margin-top:4px">A known product gives the agent its picture straight away; otherwise the hub asks the agent for one.</div>
           <label for="a-desc">Description</label>
           <input id="a-desc" placeholder="Who is it and what can it do? (optional)">
           <label>How will this agent connect?</label>
@@ -287,7 +312,7 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
-const state = { token: '', me: null, config: null, agents: [], messages: new Map(), convos: [], selected: null, lastId: 0, timer: null, stream: null };
+const state = { token: '', me: null, config: null, agents: [], catalog: [], messages: new Map(), convos: [], selected: null, lastId: 0, timer: null, stream: null };
 
 // ---------- helpers ----------
 function el(tag, attrs = {}, ...children) {
@@ -421,9 +446,11 @@ async function openStream() {
   }, 3000);
 }
 async function refresh() {
-  const [agents, stats, convos] = await Promise.all([api('/api/agents'), api('/api/stats'), api('/api/conversations')]);
+  const [agents, stats, convos, catalog] = await Promise.all([api('/api/agents'), api('/api/stats'), api('/api/conversations'), api('/api/catalog')]);
+  state.catalog = catalog.catalog;
   state.agents = agents.agents;
   state.convos = convos.conversations;
+  renderCatalog();
   $('s-agents').textContent = stats.agents;
   $('s-online').textContent = stats.online;
   $('s-messages').textContent = stats.messages;
@@ -456,7 +483,12 @@ function msgView(m, fresh = false) {
     el('div', { class: 'bubble' },
       el('div', { class: 'meta' }, el('span', { class: 'author' }, m.from), badge(agentNamed(m.from)?.kind), el('span', { class: 'to' }, `→ ${m.to}`), el('span', {}, time(m.ts)), el('span', {}, `#${m.id}`)),
       m.reply_to ? el('div', { class: 'reply-quote' }, quoted ? `↩ ${quoted.from}: ${quoted.body}` : `↩ reply to #${m.reply_to}`) : null,
-      el('div', { class: 'body' }, m.body)));
+      el('div', { class: 'body' }, m.body),
+      shots(m.body)));
+}
+function shots(body) {
+  const links = [...new Set(String(body).match(/\/images\/[0-9a-f]{16}\.(?:png|jpg|webp)/g) ?? [])].slice(0, 6);
+  return links.length ? el('div', { class: 'shots' }, links.map((src) => el('a', { href: src, target: '_blank', rel: 'noopener' }, el('img', { src, alt: 'Shared image', loading: 'lazy' })))) : null;
 }
 function renderLatest() {
   const latest = [...state.messages.values()].slice(-6).reverse();
@@ -538,6 +570,38 @@ function pickPicture(a) {
   });
   input.click();
 }
+function renderCatalog() {
+  const sel = $('a-product');
+  const current = sel.value;
+  sel.replaceChildren(el('option', { value: '' }, 'Other / not listed'), ...state.catalog.map((c) => el('option', { value: c.id }, c.maker ? `${c.name} (${c.maker})` : c.name)));
+  if (state.catalog.some((c) => c.id === current)) sel.value = current;
+  $('catalog').replaceChildren(...(state.catalog.length ? state.catalog.map((c) => el('div', { class: 'product' },
+    el('img', { src: c.image, alt: '', loading: 'lazy' }), el('strong', {}, c.name), el('span', { class: 'muted small' }, c.maker || c.id),
+    el('div', { class: 'row' },
+      el('button', { class: 'ghost', title: 'Give an agent this picture', onclick: () => applyProduct(c) }, 'Use for…'),
+      el('button', { class: 'danger', onclick: () => removeProduct(c) }, 'Remove')))) : [el('div', { class: 'muted small' }, 'No known agents yet: add one below.')]));
+}
+async function applyProduct(c) {
+  const name = prompt(`Give which agent the ${c.name} picture?`, '');
+  if (!name) return;
+  try { await api(`/api/agents/${encodeURIComponent(name.trim())}/avatar`, { method: 'PUT', body: JSON.stringify({ catalog: c.id }) }); refresh(); } catch (err) { alert(err.message); }
+}
+async function removeProduct(c) {
+  if (!confirm(`Remove ${c.name} from the known agents? Agents keep their current pictures.`)) return;
+  try { await api(`/api/catalog/${c.id}`, { method: 'DELETE' }); refresh(); } catch (err) { alert(err.message); }
+}
+const readFile = (file) => new Promise((resolve) => { const r = new FileReader(); r.onload = () => resolve(r.result); r.readAsDataURL(file); });
+$('catalog-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  $('c-error').textContent = '';
+  const file = $('c-file').files[0];
+  if (file && file.size > 256 * 1024) return ($('c-error').textContent = 'Pictures can be at most 256 KB.');
+  try {
+    await api(`/api/catalog/${$('c-id').value.trim()}`, { method: 'PUT', body: JSON.stringify({ name: $('c-name').value.trim(), maker: $('c-maker').value.trim(), ...(file ? { image: await readFile(file) } : {}) }) });
+    e.target.reset();
+    refresh();
+  } catch (err) { $('c-error').textContent = err.message; }
+});
 async function rotate(a) {
   if (!confirm(`Issue a new token for ${a.name}? Its current token stops working immediately.`)) return;
   try {
@@ -685,7 +749,8 @@ $('add-form').addEventListener('submit', async (e) => {
   const name = $('a-name').value.trim();
   const description = $('a-desc').value.trim();
   try {
-    const r = await api('/api/agents', { method: 'POST', body: JSON.stringify({ name, description, kind }) });
+    const product = $('a-product').value || undefined;
+    const r = await api('/api/agents', { method: 'POST', body: JSON.stringify({ name, description, kind, product }) });
     showPrompt(r.name, r.token, kind, description);
     $('a-name').value = $('a-desc').value = '';
     refresh();

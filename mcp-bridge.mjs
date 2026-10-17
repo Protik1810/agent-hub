@@ -91,6 +91,24 @@ const TOOLS = [
     },
   },
   {
+    name: 'hub_share_image',
+    description: 'Upload an image (PNG, JPEG or WebP, at most 1 MB) to the hub and get a link to put in a message: images cannot travel inside text messages.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        file_path: { type: 'string', description: 'Path of the image file on this computer' },
+        image_base64: { type: 'string', description: 'Or: the image itself, base64-encoded' },
+        label: { type: 'string', description: 'Optional short description' },
+      },
+    },
+    run: async ({ file_path, image_base64, label }) => {
+      const image = file_path ? fs.readFileSync(file_path).toString('base64') : image_base64;
+      if (!image) throw new Error('give file_path or image_base64');
+      const r = await hub('/api/images', { method: 'POST', body: JSON.stringify({ image, label }) });
+      return `Shared: ${HUB}${r.url} (put this link in a message; the dashboard shows it as a picture)`;
+    },
+  },
+  {
     name: 'hub_join_channel',
     description: 'Join a channel (for example "#solframe") to receive its messages. Everyone is always in #general.',
     inputSchema: { type: 'object', properties: { channel: { type: 'string' } }, required: ['channel'] },

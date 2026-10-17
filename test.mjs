@@ -128,6 +128,33 @@ try {
     assert.equal((await fetch(base + '/avatars/painter')).status, 404);
     assert.equal((await fetch(base + '/avatars/..%2Fhub.json')).status, 404);
   });
+  await check('agents share images by link; the catalogue gives known products their pictures', async () => {
+    const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+    const shared = await call(hades, 'POST', '/api/images', { image: png, label: 'a test picture' });
+    assert.equal(shared.status, 200);
+    assert.match(shared.data.url, /^\/images\/[0-9a-f]{16}\.png$/);
+    const got = await fetch(base + shared.data.url);
+    assert.equal(got.status, 200);
+    assert.equal(got.headers.get('content-type'), 'image/png');
+    assert.equal((await fetch(base + shared.data.url.replace('.png', '.webp'))).status, 404);
+    assert.equal((await fetch(base + '/images/0000000000000000.png')).status, 404);
+    assert.equal((await call(hades, 'POST', '/api/images', { image: Buffer.from('<svg/>').toString('base64') })).status, 415);
+    // catalogue: admin only; a new agent of a known product starts with its picture
+    assert.equal((await call(hades, 'PUT', '/api/catalog/hermes', { name: 'Hermes Agent', image: png })).status, 403);
+    const entry = await call(ADMIN, 'PUT', '/api/catalog/hermes', { name: 'Hermes Agent', maker: 'Nous Research', from: shared.data.url });
+    assert.equal(entry.status, 200);
+    assert.equal((await fetch(base + entry.data.image)).status, 200);
+    assert.deepEqual((await call(hades, 'GET', '/api/catalog')).data.catalog.map((c) => c.id), ['hermes']);
+    assert.equal((await call(ADMIN, 'POST', '/api/agents', { name: 'herald', product: 'nonexistent' })).status, 400);
+    const herald = await call(ADMIN, 'POST', '/api/agents', { name: 'herald', product: 'hermes' });
+    assert.equal(herald.status, 201);
+    const listed = (await call(ADMIN, 'GET', '/api/agents')).data.agents.find((a) => a.name === 'herald');
+    assert.equal(listed.product, 'hermes');
+    assert.match(listed.avatar, /^\/avatars\/herald/);
+    assert.equal((await call(ADMIN, 'PUT', '/api/agents/eve/avatar', { catalog: 'hermes' })).status, 200);
+    assert.equal((await call(ADMIN, 'DELETE', '/api/catalog/hermes')).status, 200);
+    assert.equal((await fetch(base + entry.data.image)).status, 404);
+  });
   await check('presence: an agent waiting for messages counts as connected and online', async () => {
     const waiting = call(hades, 'GET', '/api/messages?since=999999&wait=3');
     await new Promise((r) => setTimeout(r, 300));
@@ -169,7 +196,7 @@ try {
     assert.equal(init.result.serverInfo.name, 'agent-hub');
     bridge.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
     const tools = (await rpc('tools/list')).result.tools.map((t) => t.name);
-    assert.deepEqual(tools, ['hub_whoami', 'hub_list_agents', 'hub_send', 'hub_read', 'hub_set_avatar', 'hub_join_channel', 'hub_leave_channel']);
+    assert.deepEqual(tools, ['hub_whoami', 'hub_list_agents', 'hub_send', 'hub_read', 'hub_set_avatar', 'hub_share_image', 'hub_join_channel', 'hub_leave_channel']);
     const sent = await rpc('tools/call', { name: 'hub_send', arguments: { to: 'hades', body: 'sent through MCP' } });
     assert.match(sent.result.content[0].text, /Sent message #\d+ to hades/);
     const read = await rpc('tools/call', { name: 'hub_read', arguments: {} });
