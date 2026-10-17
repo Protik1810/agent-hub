@@ -325,8 +325,8 @@ try {
     const sess = a.data.token;
     assert.equal((await call(sess, 'GET', '/api/me')).data.admin, true);
     // the admin code is shown to a signed-in admin, never to agents
-    assert.equal((await call(sess, 'GET', '/api/admin-token')).data.token, ADMIN);
-    assert.equal((await call(eveToken(), 'GET', '/api/admin-token')).status, 403);
+    assert.equal((await call(sess, 'GET', '/api/account/token')).data.token, ADMIN);
+    assert.equal((await call(eveToken(), 'GET', '/api/account/token')).status, 403);
     // a code for another device works once
     const { code } = (await call(sess, 'POST', '/api/login-codes', { anywhere: true })).data;
     assert.match(code, /^[0-9A-F]{12}$/);
@@ -351,6 +351,65 @@ try {
     await new Promise((r) => setTimeout(r, 400));
     const store = fs.readFileSync(path.join(data, 'hub.json'), 'utf8');
     assert(!store.includes('tokenHash') && !store.includes('"sessions"'), 'credentials are not kept in hub.json');
+  });
+  await check('accounts: sign up once, sign in with a password, one token until revoked; history in a folder', async () => {
+    const data2 = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-hub-test-acct-'));
+    const history = path.join(data2, 'Documents', 'Agent Hub');
+    const port2 = port + 1;
+    const base2 = `http://127.0.0.1:${port2}`;
+    const call2 = async (token, method, p, body) => {
+      const res = await fetch(base2 + p, { method, headers: { ...(token ? { authorization: `Bearer ${token}` } : {}), 'content-type': 'application/json' }, body: body && JSON.stringify(body) });
+      return { status: res.status, data: await res.json() };
+    };
+    const env = { ...process.env, HUB_HOST: '127.0.0.1', HUB_PORT: String(port2), HUB_DATA: path.join(data2, 'data'), HUB_HISTORY: history };
+    delete env.HUB_ADMIN_TOKEN;
+    const start = () => {
+      const child = spawn(process.execPath, [path.join(here, 'server.mjs')], { env, stdio: ['ignore', 'pipe', 'inherit'] });
+      return new Promise((resolve) => child.stdout.on('data', (d) => d.toString().includes('listening') && resolve(child)));
+    };
+    const stop = (child) => new Promise((r) => { child.once('exit', r); child.kill(); });
+    let hub2 = await start();
+    try {
+      // no account yet: no admin token file, sign up is offered on this computer
+      assert(!fs.existsSync(path.join(data2, 'data', 'admin-token.txt')));
+      assert.deepEqual((await call2(null, 'GET', '/api/setup')).data, { hasAccount: false, canSignUpHere: true, needsSetupCode: false, version: (await call2(null, 'GET', '/api/health')).data.version });
+      assert.equal((await call2(null, 'POST', '/api/signup', { username: 'protik', password: 'short' })).status, 400);
+      const up = await call2(null, 'POST', '/api/signup', { username: 'protik', password: 'correct horse battery' });
+      assert.equal(up.status, 200);
+      assert.equal((await call2(null, 'POST', '/api/signup', { username: 'someone', password: 'another password' })).status, 409, 'one account per hub');
+      const sess = up.data.token;
+      // no token until asked for; then exactly one, shown again on request, until revoked
+      assert.equal((await call2(sess, 'GET', '/api/account/token')).data.token, null);
+      const made = await call2(sess, 'POST', '/api/account/token');
+      assert.match(made.data.token, /^ahub_/);
+      assert.equal((await call2(sess, 'POST', '/api/account/token')).status, 409);
+      assert.equal((await call2(sess, 'GET', '/api/account/token')).data.token, made.data.token);
+      assert.equal((await call2(made.data.token, 'GET', '/api/me')).data.admin, true, 'the token works as the admin token');
+      assert.equal((await call2(sess, 'DELETE', '/api/account/token')).status, 200);
+      assert.equal((await call2(made.data.token, 'GET', '/api/me')).status, 401, 'a revoked token stops working');
+      // passwords: wrong ones fail, the right one opens a new session
+      assert.equal((await call2(null, 'POST', '/api/login', { username: 'protik', password: 'nope nope nope' })).status, 401);
+      const login = await call2(null, 'POST', '/api/login', { username: 'PROTIK', password: 'correct horse battery' });
+      assert.equal(login.status, 200, 'usernames are not case-sensitive');
+      assert.equal((await call2(login.data.token, 'GET', '/api/account')).data.username, 'protik');
+      const db = fs.readFileSync(path.join(data2, 'data', 'users.db')).toString('latin1');
+      assert(!db.includes('correct horse battery'), 'passwords are stored hashed');
+      // chat history goes to the folder, readable, and comes back if the hub's own store is lost
+      const bot = (await call2(login.data.token, 'POST', '/api/agents', { name: 'scribe', kind: 'http' })).data.token;
+      await call2(bot, 'POST', '/api/messages', { to: '#general', body: 'Remember this.' });
+      await new Promise((r) => setTimeout(r, 400));
+      assert(fs.readFileSync(path.join(history, 'messages.jsonl'), 'utf8').includes('Remember this.'));
+      assert(fs.readFileSync(path.join(history, 'Conversations', 'chat-general.md'), 'utf8').includes('Remember this.'));
+      assert(JSON.parse(fs.readFileSync(path.join(history, 'context.json'), 'utf8')).agents.some((a) => a.name === 'scribe'));
+      await stop(hub2);
+      fs.rmSync(path.join(data2, 'data', 'hub.json'));
+      hub2 = await start();
+      const back = (await call2(login.data.token, 'GET', '/api/messages?since=0')).data.messages;
+      assert(back.some((m) => m.body === 'Remember this.'), 'messages come back from the history folder');
+    } finally {
+      await stop(hub2);
+      fs.rmSync(data2, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
   });
   await check('presence: an agent waiting for messages counts as connected and online', async () => {
     const waiting = call(hades, 'GET', '/api/messages?since=999999&wait=3');

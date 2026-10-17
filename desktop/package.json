@@ -1,0 +1,102 @@
+{
+  "name": "agent-hub-desktop",
+  "productName": "Agent Hub",
+  "version": "1.9.0",
+  "description": "Agent Hub desktop app: the hub runs in the background and the dashboard opens in its own window",
+  "author": "Protik",
+  "license": "MIT",
+  "private": true,
+  "main": "main.cjs",
+  "devDependencies": {
+    "electron": "44.9.0",
+    "electron-builder": "26.15.3"
+  },
+  "scripts": {
+    "start": "electron .",
+    "build:win": "electron-builder --win --x64",
+    "build:linux": "electron-builder --linux --x64"
+  },
+  "build": {
+    "appId": "io.github.protik1810.agenthub",
+    "productName": "Agent Hub",
+    "copyright": "Copyright (c) Protik",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "main.cjs",
+      "build/icon.png",
+      "build/tray.png",
+      "build/tray.ico"
+    ],
+    "extraResources": [
+      {
+        "from": "..",
+        "to": "hub",
+        "filter": [
+          "server.mjs",
+          "ui.html",
+          "mcp-bridge.mjs",
+          "assets/**/*",
+          "LICENSE"
+        ]
+      }
+    ],
+    "asar": true,
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.ico",
+      "artifactName": "AgentHub-Setup-windows-x64.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Agent Hub",
+      "runAfterFinish": true,
+      "deleteAppDataOnUninstall": false,
+      "artifactName": "AgentHub-Setup-windows-x64.${ext}",
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "installerHeaderIcon": "build/icon.ico"
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "tar.gz",
+        "deb"
+      ],
+      "category": "Network",
+      "icon": "build/icon.png",
+      "synopsis": "A meeting place for AI agents",
+      "maintainer": "Protik <213750991+Protik1810@users.noreply.github.com>",
+      "artifactName": "agent-hub-linux-x64.${ext}",
+      "executableName": "agent-hub",
+      "syncDesktopName": true,
+      "desktop": {
+        "entry": {
+          "Name": "Agent Hub",
+          "Comment": "A meeting place for AI agents",
+          "Categories": "Network;Chat;Development;"
+        }
+      }
+    },
+    "deb": {
+      "artifactName": "agent-hub-linux-amd64.${ext}"
+    },
+    "publish": null
+  },
+  "desktopName": "agent-hub.desktop",
+  "homepage": "https://protik1810.github.io/agent-hub/",
+  "repository": "github:Protik1810/agent-hub"
+}

@@ -1,16 +1,19 @@
 {
   "name": "agent-hub",
-  "version": "1.8.0",
+  "version": "1.9.0",
   "description": "A small, dependency-free message hub where AI agents (Claude Code, Hermes, Cursor, custom bots) and people talk to each other across a network, with a live dashboard, onboarding prompts and an MCP bridge",
   "type": "module",
   "license": "MIT",
   "author": "Protik",
-  "engines": { "node": ">=22.13" },
+  "engines": {
+    "node": ">=22.13"
+  },
   "scripts": {
     "start": "node server.mjs",
     "bridge": "node mcp-bridge.mjs",
     "test": "node test.mjs",
-    "package": "node tools/package.mjs",
-    "screenshots": "node tools/screenshots.mjs"
+    "screenshots": "node tools/screenshots.mjs",
+    "desktop": "cd desktop && npm install && npm start",
+    "build:desktop": "cd desktop && npm ci && npm run build:win"
   }
 }

@@ -1,0 +1,95 @@
+# Builds the desktop apps and publishes them to a GitHub release.
+# Runs on version tags (v1.9.0) and by hand (Actions → Release → Run workflow), which builds without publishing.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: node test.mjs
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: --win --x64
+          - os: ubuntu-latest
+            target: --linux --x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - name: Install
+        working-directory: desktop
+        run: npm ci
+      - name: Build
+        working-directory: desktop
+        run: npx electron-builder ${{ matrix.target }} --publish never
+      - name: Smoke test (Linux)
+        if: runner.os == 'Linux'
+        working-directory: desktop/dist/linux-unpacked
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq xvfb > /dev/null
+          export HOME="$(mktemp -d)"
+          mkdir -p "$HOME/.config/Agent Hub" && echo '{"port":7791}' > "$HOME/.config/Agent Hub/settings.json"
+          xvfb-run -a ./agent-hub --no-sandbox > "$RUNNER_TEMP/app.log" 2>&1 &
+          for i in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:7791/api/health; then echo; break; fi
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:7791/api/setup | tee /dev/stderr | grep -q '"canSignUpHere":true'
+          curl -sf -o /dev/null http://127.0.0.1:7791/
+          test -f "$HOME/Documents/Agent Hub/README.txt" || test -f "$HOME/Agent Hub/README.txt"
+          echo "the app started, the hub answered, and the chat history folder exists"
+          cat "$HOME/.config/Agent Hub/logs/hub.log"
+          pkill -f agent-hub || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ runner.os }}
+          path: |
+            desktop/dist/*.exe
+            desktop/dist/*.AppImage
+            desktop/dist/*.deb
+            desktop/dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - name: Checksums
+        working-directory: out
+        run: sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "Agent Hub ${GITHUB_REF_NAME#v}" --notes "Desktop apps for Windows and Linux. See the README for what's new."
+          gh release upload "$GITHUB_REF_NAME" out/* --repo "$GITHUB_REPOSITORY" --clobber

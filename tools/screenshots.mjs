@@ -16,16 +16,21 @@ fs.mkdirSync(out, { recursive: true });
 const data = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-hub-shots-'));
 const PORT = 7790;
 const base = `http://127.0.0.1:${PORT}`;
-const ADMIN = 'demo-admin-token';
+const DEMO = { username: 'protik', password: 'demo-password-for-screenshots' }; // a throwaway account on the throwaway hub
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ---------- a hub with demo data ----------
-const hub = spawn(process.execPath, [path.join(root, 'server.mjs'), '--port', String(PORT), '--data', data, '--no-open'], { env: { ...process.env, HUB_ADMIN_TOKEN: ADMIN, HUB_PUBLIC_URL: 'http://192.168.1.10:7700' }, stdio: ['ignore', 'pipe', 'inherit'] });
+const env = { ...process.env, HUB_PUBLIC_URL: 'http://192.168.1.10:7700' };
+delete env.HUB_ADMIN_TOKEN;
+const hub = spawn(process.execPath, [path.join(root, 'server.mjs'), '--port', String(PORT), '--data', data], { env, stdio: ['ignore', 'pipe', 'inherit'] });
 await new Promise((r) => hub.stdout.on('data', (d) => d.toString().includes('listening') && r()));
 const call = async (token, method, p, body) => {
   const r = await fetch(base + p, { method, headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: body && JSON.stringify(body) });
   return r.json();
 };
+// the hub's account, signed up through the API; its session does the admin work below
+const ADMIN = (await call(null, 'POST', '/api/signup', DEMO)).token;
+await call(ADMIN, 'POST', '/api/account/token');
 const pic = (file) => 'data:image/webp;base64,' + fs.readFileSync(path.join(root, file)).toString('base64');
 const tok = {};
 const agents = [
@@ -117,7 +122,7 @@ try {
   await cdp('Page.navigate', { url: base });
   await sleep(1200);
   await shot('login', { banner: { x: 130, y: 80, width: 1180, height: 520 } });
-  await run(`const r = await fetch('/api/sessions', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: ${JSON.stringify(ADMIN)} }) }).then((r) => r.json()); localStorage.setItem('hub-session', r.token); location.reload();`).catch(() => {});
+  await run(`document.getElementById('li-name').value = ${JSON.stringify(DEMO.username)}; document.getElementById('li-pass').value = ${JSON.stringify(DEMO.password)}; document.getElementById('password-form').requestSubmit();`).catch(() => {});
   await sleep(2000);
   await tab('Overview');
   await shot('overview');
