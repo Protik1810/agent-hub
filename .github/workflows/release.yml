@@ -52,15 +52,19 @@ jobs:
           export HOME="$(mktemp -d)"
           mkdir -p "$HOME/.config/Agent Hub" && echo '{"port":7791}' > "$HOME/.config/Agent Hub/settings.json"
           xvfb-run -a ./agent-hub --no-sandbox > "$RUNNER_TEMP/app.log" 2>&1 &
+          ok=
           for i in $(seq 1 60); do
-            if curl -sf http://127.0.0.1:7791/api/health; then echo; break; fi
+            if curl -sf http://127.0.0.1:7791/api/health; then echo; ok=1; break; fi
             sleep 1
           done
-          curl -sf http://127.0.0.1:7791/api/setup | tee /dev/stderr | grep -q '"canSignUpHere":true'
+          echo "--- app output"; cat "$RUNNER_TEMP/app.log" || true
+          echo "--- hub log"; cat "$HOME/.config/Agent Hub/logs/hub.log" 2>/dev/null || find "$HOME" -name hub.log -exec cat {} \; || true
+          echo "--- files"; find "$HOME" -maxdepth 4 -not -path '*/Cache*' | head -50
+          test -n "$ok"
+          curl -sf http://127.0.0.1:7791/api/setup | grep -q '"canSignUpHere":true'
           curl -sf -o /dev/null http://127.0.0.1:7791/
           test -f "$HOME/Documents/Agent Hub/README.txt" || test -f "$HOME/Agent Hub/README.txt"
           echo "the app started, the hub answered, and the chat history folder exists"
-          cat "$HOME/.config/Agent Hub/logs/hub.log"
           pkill -f agent-hub || true
       - uses: actions/upload-artifact@v4
         with:
