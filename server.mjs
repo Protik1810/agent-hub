@@ -14,7 +14,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
-const VERSION = '1.4.0';
+const VERSION = '1.5.0';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const HOST = process.env.HUB_HOST ?? '127.0.0.1';
 const PORT = Number(process.env.HUB_PORT ?? 7700);
@@ -114,6 +114,8 @@ function post(from, { to, body, reply_to, kind }) {
   if (db.agents[from]) db.agents[from].sent = (db.agents[from].sent ?? 0) + 1;
   save();
   for (const w of waiters) if (visible(w.name, m)) w.push(m);
+  if (m.reply_to !== null && taskByMessage.has(m.reply_to)) a2aReply(m);
+  if (db.agents[to]?.kind === 'a2a' && db.agents[from]?.kind !== 'a2a') forwardA2A(m); // (never between two remote agents: no loops)
   return m;
 }
 
@@ -217,6 +219,7 @@ const publicAgent = (name, a) => ({
   disabled: !!a.disabled,
   avatar: a.avatar ? `/avatars/${name}?v=${a.avatar.updated}` : null,
   product: a.product ?? null,
+  a2a: a.kind === 'a2a' ? { remote: true, endpoint: a.a2a?.url, agent: a.a2a?.name, skills: a.a2a?.skills ?? [] } : { card: `/a2a/${name}/.well-known/agent-card.json` },
 });
 
 // ---------- HTTP ----------
@@ -291,10 +294,11 @@ route('GET', '/api/conversations', ({ me }) => {
 // Admin: create an agent; its token is returned once and only its hash is stored
 route('POST', '/api/agents', async ({ me, req }) => {
   if (!me.admin) throw httpError(403, 'only the admin can create agents');
-  const { name, description, kind, product } = await readJson(req);
+  const { name, description, kind, product, a2aUrl, a2aToken } = await readJson(req);
   if (typeof name !== 'string' || !NAME.test(name) || RESERVED.has(name)) throw httpError(400, 'name must be 1-32 characters: a-z, 0-9, - or _ (and not reserved)');
   if (db.agents[name]) throw httpError(409, `agent "${name}" already exists`);
   if (product !== undefined && product !== null && product !== '' && !db.catalog[product]) throw httpError(400, `unknown product "${product}"`);
+  if (kind === 'a2a') return registerRemote(name, { url: a2aUrl, token: a2aToken, description, product });
   const token = newToken();
   db.agents[name] = {
     tokenHash: sha256(token),
@@ -452,6 +456,269 @@ route('GET', '/api/stream', ({ me, req, res }) => {
   });
   return undefined; // keep the response open
 });
+
+// ---------- A2A: the Agent2Agent protocol (https://a2a-protocol.org) ----------
+// Inbound: every hub agent has an agent card and a JSON-RPC endpoint (/a2a/<name>). A request becomes a hub message
+// to the agent (kind "a2a"); the agent's reply to that message completes the task.
+// Outbound: a remote A2A agent registered by the admin (kind "a2a") receives hub messages over A2A, and its answers
+// come back as replies.
+const A2A_VERSION = '0.3.0';
+const TERMINAL = new Set(['completed', 'canceled', 'failed', 'rejected']);
+db.a2aTasks ??= {};
+const taskByMessage = new Map(); // hub message id -> A2A task id
+for (const t of Object.values(db.a2aTasks)) for (const mid of t.hubMessages) taskByMessage.set(mid, t.id);
+const taskWatchers = new Map(); // task id -> Set of listeners
+const baseUrl = (req) => PUBLIC_URL || `http://${req.headers.host}`;
+const textOf = (parts) => (Array.isArray(parts) ? parts.filter((x) => x && typeof x.text === 'string' && (x.kind ?? x.type ?? 'text') === 'text').map((x) => x.text).join('\n') : '');
+const agentMessage = (text, t) => ({ kind: 'message', role: 'agent', parts: [{ kind: 'text', text }], messageId: crypto.randomUUID(), taskId: t.id, contextId: t.contextId });
+
+function publicTask(t, historyLength) {
+  const history = historyLength === 0 ? [] : historyLength > 0 ? t.history.slice(-historyLength) : t.history;
+  return { kind: 'task', id: t.id, contextId: t.contextId, status: t.status, history, artifacts: t.artifacts, metadata: { hub: { agent: t.target, caller: t.caller } } };
+}
+function setTaskStatus(t, state, message) {
+  t.status = { state, ...(message ? { message } : {}), timestamp: new Date().toISOString() };
+  if (message) t.history.push(message);
+  save();
+  for (const fn of [...(taskWatchers.get(t.id) ?? [])]) fn(t);
+}
+function watchTask(t, fn) {
+  if (!taskWatchers.has(t.id)) taskWatchers.set(t.id, new Set());
+  taskWatchers.get(t.id).add(fn);
+  return () => taskWatchers.get(t.id)?.delete(fn);
+}
+/** Waits until the task leaves submitted/working, or the time runs out. */
+const settled = (t, ms) => new Promise((resolve) => {
+  if (!['submitted', 'working'].includes(t.status.state)) return resolve();
+  const stop = watchTask(t, (x) => { if (!['submitted', 'working'].includes(x.status.state)) done(); });
+  const timer = setTimeout(done, ms);
+  function done() { clearTimeout(timer); stop(); resolve(); }
+});
+
+function agentCard(name, a, base) {
+  return {
+    protocolVersion: A2A_VERSION,
+    name,
+    description: a.description || `${name}, an agent on Agent Hub`,
+    url: `${base}/a2a/${name}`,
+    preferredTransport: 'JSONRPC',
+    version: VERSION,
+    provider: { organization: 'Agent Hub', url: base },
+    ...(a.avatar ? { iconUrl: `${base}/avatars/${name}` } : {}),
+    capabilities: { streaming: true, pushNotifications: false, stateTransitionHistory: false },
+    defaultInputModes: ['text/plain'],
+    defaultOutputModes: ['text/plain'],
+    skills: [{ id: 'message', name: `Message ${name}`, description: `Send ${name} a message. The task completes when ${name} replies on the hub, which can take a while: use message/stream or poll tasks/get.`, tags: ['chat', a.kind ?? 'agent'], examples: ['Hello! Could you help me with ...?'] }],
+    securitySchemes: { bearer: { type: 'http', scheme: 'bearer', description: 'An Agent Hub agent token (ask the hub admin for one)' } },
+    security: [{ bearer: [] }],
+  };
+}
+
+/** A hub agent answered a message that belongs to an A2A task. */
+function a2aReply(m) {
+  const t = db.a2aTasks[taskByMessage.get(m.reply_to)];
+  if (!t || m.from !== t.target || TERMINAL.has(t.status.state)) return;
+  t.hubMessages.push(m.id);
+  taskByMessage.set(m.id, t.id);
+  const message = agentMessage(m.body, t);
+  // The reply's kind can steer the task: "a2a-working" (progress), "a2a-input" (needs input), "a2a-failed"
+  if (m.kind === 'a2a-working') return setTaskStatus(t, 'working', message);
+  if (m.kind === 'a2a-input') return setTaskStatus(t, 'input-required', message);
+  if (m.kind === 'a2a-failed') return setTaskStatus(t, 'failed', message);
+  t.artifacts.push({ artifactId: crypto.randomUUID(), name: 'reply', parts: [{ kind: 'text', text: m.body }] });
+  setTaskStatus(t, 'completed', message);
+}
+
+function pruneTasks() {
+  const ids = Object.keys(db.a2aTasks);
+  for (const id of ids.slice(0, Math.max(0, ids.length - 2000))) {
+    for (const mid of db.a2aTasks[id].hubMessages) taskByMessage.delete(mid);
+    delete db.a2aTasks[id];
+  }
+}
+
+const rpcResult = (id, result) => ({ jsonrpc: '2.0', id, result });
+const rpcError = (id, code, message) => ({ jsonrpc: '2.0', id, error: { code, message } });
+
+route('GET', '/a2a', ({ req }) => ({
+  agents: Object.entries(db.agents).filter(([, a]) => !a.disabled && a.kind !== 'a2a').map(([name, a]) => ({ name, description: a.description, card: `${baseUrl(req)}/a2a/${name}/.well-known/agent-card.json` })),
+}), { open: true });
+
+route('GET', '/a2a/([a-z0-9_-]+)/\\.well-known/(agent-card|agent)\\.json', ({ req, params }) => {
+  const a = db.agents[params[0]];
+  if (!a || a.disabled || a.kind === 'a2a') throw httpError(404, 'no such agent');
+  return agentCard(params[0], a, baseUrl(req));
+}, { open: true });
+
+route('POST', '/a2a/([a-z0-9_-]+)', async ({ me, req, res, params }) => {
+  const target = params[0];
+  const a = db.agents[target];
+  if (!a || a.disabled) throw httpError(404, 'no such agent');
+  let rpc;
+  try {
+    rpc = await readJson(req);
+  } catch {
+    return rpcError(null, -32700, 'Parse error');
+  }
+  const id = rpc?.id ?? null;
+  const p = rpc?.params ?? {};
+  switch (rpc?.method) {
+    case 'message/send':
+    case 'message/stream': {
+      if (a.kind === 'a2a') return rpcError(id, -32004, `${target} is a remote A2A agent: call its own endpoint`);
+      if (target === me.name) return rpcError(id, -32602, 'you cannot send a task to yourself');
+      const msg = p.message;
+      const text = textOf(msg?.parts);
+      if (!text.trim()) return rpcError(id, -32005, 'the message needs at least one text part');
+      let t = null;
+      if (msg.taskId) {
+        t = db.a2aTasks[msg.taskId];
+        if (!t || t.caller !== me.name || t.target !== target) return rpcError(id, -32001, 'Task not found');
+        if (TERMINAL.has(t.status.state)) return rpcError(id, -32004, `the task is already ${t.status.state}: start a new one`);
+      } else {
+        t = { id: crypto.randomUUID(), contextId: msg.contextId || crypto.randomUUID(), target, caller: me.name, history: [], artifacts: [], hubMessages: [], status: null, created: new Date().toISOString() };
+        db.a2aTasks[t.id] = t;
+        pruneTasks();
+      }
+      t.history.push({ ...msg, kind: 'message', role: 'user', messageId: msg.messageId || crypto.randomUUID(), taskId: t.id, contextId: t.contextId });
+      const hubMessage = post(me.name, { to: target, kind: 'a2a', body: text, reply_to: t.hubMessages.at(-1) ?? null });
+      t.hubMessages.push(hubMessage.id);
+      taskByMessage.set(hubMessage.id, t.id);
+      setTaskStatus(t, 'submitted');
+      if (rpc.method === 'message/stream') {
+        res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store', connection: 'keep-alive' });
+        const event = (result) => res.write(`data: ${JSON.stringify(rpcResult(id, result))}\n\n`);
+        event(publicTask(t));
+        const finish = () => { stop(); clearTimeout(limit); clearInterval(ping); res.end(); };
+        const stop = watchTask(t, (x) => {
+          const final = TERMINAL.has(x.status.state) || x.status.state === 'input-required';
+          event({ kind: 'status-update', taskId: x.id, contextId: x.contextId, status: x.status, final });
+          if (final) finish();
+        });
+        const ping = setInterval(() => res.write(': ping\n\n'), 25_000);
+        const limit = setTimeout(finish, 15 * 60 * 1000);
+        req.on('close', finish);
+        return undefined;
+      }
+      // Blocking by default: wait (up to 55 s) for the agent to answer; otherwise return the task to poll
+      if (p.configuration?.blocking !== false) await settled(t, 55_000);
+      return rpcResult(id, publicTask(t, p.configuration?.historyLength));
+    }
+    case 'tasks/get': {
+      const t = db.a2aTasks[p.id];
+      if (!t || (!me.admin && me.name !== t.caller && me.name !== t.target)) return rpcError(id, -32001, 'Task not found');
+      return rpcResult(id, publicTask(t, p.historyLength));
+    }
+    case 'tasks/cancel': {
+      const t = db.a2aTasks[p.id];
+      if (!t || (!me.admin && me.name !== t.caller)) return rpcError(id, -32001, 'Task not found');
+      if (TERMINAL.has(t.status.state)) return rpcError(id, -32002, `Task cannot be canceled: it is already ${t.status.state}`);
+      setTaskStatus(t, 'canceled');
+      post('hub', { to: t.target, kind: 'system', reply_to: t.hubMessages.at(-1) ?? null, body: `${t.caller} canceled the A2A request above: no answer is needed any more.` });
+      return rpcResult(id, publicTask(t));
+    }
+    case 'tasks/pushNotificationConfig/set':
+    case 'tasks/pushNotificationConfig/get':
+      return rpcError(id, -32003, 'Push notifications are not supported: use message/stream or tasks/get');
+    default:
+      return rpcError(id, -32601, `Method not found: ${rpc?.method}`);
+  }
+});
+
+// ---------- outbound: remote A2A agents ----------
+async function fetchJson(url, init = {}, ms = 15_000) {
+  const res = await fetch(url, { ...init, signal: AbortSignal.timeout(ms), redirect: 'follow' });
+  const text = await res.text();
+  if (text.length > 2 * 1024 * 1024) throw new Error('response too large');
+  if (!res.ok) throw new Error(`HTTP ${res.status} from ${url}`);
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(`not JSON from ${url}`);
+  }
+}
+/** Reads a remote agent's card from its card URL or its base URL. */
+async function readCard(url) {
+  let u;
+  try {
+    u = new URL(url);
+  } catch {
+    throw httpError(400, 'a2aUrl must be the agent card URL or the agent base URL');
+  }
+  if (!['http:', 'https:'].includes(u.protocol)) throw httpError(400, 'a2aUrl must use http or https');
+  const tries = /\.json$/.test(u.pathname) ? [u.href] : ['agent-card.json', 'agent.json'].map((f) => new URL(`.well-known/${f}`, u.href.endsWith('/') ? u.href : u.href + '/').href);
+  let last;
+  for (const href of tries) {
+    try {
+      const card = await fetchJson(href, { headers: { accept: 'application/json' } });
+      if (!card || typeof card.url !== 'string') throw new Error('the agent card has no "url"');
+      return card;
+    } catch (e) {
+      last = e;
+    }
+  }
+  throw httpError(502, `could not read an agent card: ${last?.message}`);
+}
+async function registerRemote(name, { url, token, description, product }) {
+  const card = await readCard(url);
+  const endpoint = new URL(card.url, url).href;
+  db.agents[name] = {
+    tokenHash: sha256(newToken()), // remote agents talk through the hub's A2A client, not with a hub token
+    description: String(description || card.description || '').slice(0, 500),
+    kind: 'a2a',
+    channels: [],
+    created: new Date().toISOString(),
+    product: product || null,
+    a2a: { url: endpoint, cardUrl: url, name: String(card.name ?? '').slice(0, 100), skills: (card.skills ?? []).map((k) => String(k?.name ?? k?.id ?? '')).slice(0, 20), streaming: !!card.capabilities?.streaming, ...(token ? { token: String(token) } : {}), contexts: {} },
+  };
+  if (product) setAvatar(name, storedImage({ catalog: product }));
+  save();
+  return { name, a2a: { endpoint, agent: db.agents[name].a2a.name, skills: db.agents[name].a2a.skills } };
+}
+async function a2aCall(remote, method, params) {
+  const data = await fetchJson(remote.url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', accept: 'application/json', ...(remote.token ? { authorization: `Bearer ${remote.token}` } : {}) },
+    body: JSON.stringify({ jsonrpc: '2.0', id: crypto.randomUUID(), method, params }),
+  }, 70_000);
+  if (data.error) throw new Error(`${data.error.message ?? 'error'} (${data.error.code})`);
+  return data.result;
+}
+function a2aText(result) {
+  if (!result) return '';
+  if (result.kind === 'message' || (result.parts && !result.status)) return textOf(result.parts);
+  const fromArtifacts = (result.artifacts ?? []).map((x) => textOf(x.parts)).filter(Boolean).join('\n\n');
+  const status = textOf(result.status?.message?.parts);
+  const lastAgent = textOf([...(result.history ?? [])].reverse().find((x) => x.role === 'agent')?.parts);
+  const text = fromArtifacts || status || lastAgent;
+  const state = result.status?.state;
+  return state && state !== 'completed' ? `[${state}] ${text}`.trim() : text;
+}
+/** A hub message to a remote A2A agent: send it over A2A and post the answer back as a reply. */
+async function forwardA2A(m) {
+  const a = db.agents[m.to];
+  const remote = a.a2a;
+  const key = [m.from, m.to].sort().join('|');
+  remote.contexts ??= {};
+  remote.contexts[key] ??= crypto.randomUUID();
+  try {
+    let result = await a2aCall(remote, 'message/send', {
+      message: { kind: 'message', role: 'user', messageId: crypto.randomUUID(), contextId: remote.contexts[key], parts: [{ kind: 'text', text: m.body }], metadata: { agentHub: { from: m.from, messageId: m.id } } },
+      configuration: { blocking: true, acceptedOutputModes: ['text/plain'] },
+    });
+    const deadline = Date.now() + 5 * 60 * 1000;
+    while (result?.kind === 'task' && ['submitted', 'working'].includes(result.status?.state) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 2000));
+      result = await a2aCall(remote, 'tasks/get', { id: result.id });
+    }
+    if (result?.contextId) remote.contexts[key] = result.contextId;
+    a.lastSeen = new Date().toISOString();
+    save();
+    post(m.to, { to: m.from, kind: 'a2a', reply_to: m.id, body: a2aText(result) || '(the A2A agent answered without any text)' });
+  } catch (e) {
+    post('hub', { to: m.from, kind: 'system', reply_to: m.id, body: `Could not reach the remote A2A agent ${m.to}: ${e.message}` });
+  }
+}
 
 const UI = fs.readFileSync(path.join(here, 'ui.html'), 'utf8');
 const BRIDGE = fs.readFileSync(path.join(here, 'mcp-bridge.mjs'), 'utf8');

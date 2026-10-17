@@ -89,6 +89,9 @@
   .badge { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; background: var(--accent-soft); color: var(--accent); }
   .badge.mcp { background: var(--signal-soft); color: var(--signal); }
   .badge.python { background: var(--ok-soft); color: var(--ok); }
+  .badge.a2a { background: color-mix(in srgb, var(--warn) 14%, transparent); color: var(--warn); }
+  .linkish { color: var(--accent); font-size: 12px; text-decoration: none; }
+  .linkish:hover { text-decoration: underline; }
 
   .agent-row { display: flex; gap: 12px; align-items: flex-start; padding: 12px 0; border-bottom: 1px solid var(--line); }
   .agent-row:last-child { border-bottom: 0; }
@@ -287,15 +290,24 @@
           <input id="a-desc" placeholder="Who is it and what can it do? (optional)">
           <label>How will this agent connect?</label>
           <div class="choices" id="kinds"></div>
+          <div id="a2a-fields" hidden>
+            <label for="a2a-url">Agent card URL (or the agent's base URL)</label>
+            <input id="a2a-url" placeholder="https://agent.example.com/.well-known/agent-card.json">
+            <label for="a2a-token">Token for that agent (optional)</label>
+            <input id="a2a-token" type="password" autocomplete="off" placeholder="sent as Authorization: Bearer ... to the remote agent">
+            <div class="muted small" style="margin-top:4px">The hub reads the agent card, then forwards every message sent to this agent over A2A and posts its answers back as replies. The token is stored on the hub (data/hub.json) and never shown again.</div>
+          </div>
+          <div id="hub-url-fields">
           <label for="a-url">Hub address the agent should use</label>
           <input id="a-url">
           <div id="url-warning" class="notice small" hidden>This address only works on this computer. For agents on other machines, open the dashboard through the hub's network address (for example <code>http://192.168.1.10:7700</code>) or set <code>HUB_PUBLIC_URL</code>.</div>
-          <p><button>Create agent and prompt</button> <span id="add-error" class="err"></span></p>
+          </div>
+          <p><button id="add-submit">Create agent and prompt</button> <span id="add-error" class="err"></span></p>
         </form>
       </div>
       <div class="card" id="prompt-card" hidden>
         <h2>Prompt for <span id="p-name"></span></h2>
-        <p class="notice small">This prompt contains the agent's token, shown only now. Give it to that agent only, through a private channel. Lost it? Use <em>New token</em> on the Agents tab.</p>
+        <p id="token-notice" class="notice small">This prompt contains the agent's token, shown only now. Give it to that agent only, through a private channel. Lost it? Use <em>New token</em> on the Agents tab.</p>
         <p class="row"><button id="copy-prompt">Copy prompt</button> <span id="copied" class="muted small" role="status"></span></p>
         <pre class="prompt" id="prompt-text"></pre>
       </div>
@@ -344,7 +356,7 @@ async function api(path, opts = {}) {
 }
 const convoTitle = (c) => (c.kind === 'channel' ? c.key : c.participants.join(' ↔ '));
 const convoKey = (m) => (m.to.startsWith('#') ? m.to : [m.from, m.to].sort().join('|'));
-const AVATARS = { http: '/assets/avatar-http.webp', mcp: '/assets/avatar-mcp.webp', python: '/assets/avatar-script.webp' };
+const AVATARS = { http: '/assets/avatar-http.webp', mcp: '/assets/avatar-mcp.webp', python: '/assets/avatar-script.webp', a2a: '/assets/logo-mark.webp' };
 const agentNamed = (name) => state.agents.find((a) => a.name === name);
 function avatar(name, cls = '') {
   if (name === 'admin') return el('div', { class: `avatar admin ${cls}`, 'aria-hidden': 'true' }, 'A');
@@ -551,12 +563,14 @@ function renderAgents() {
     el('td', {}, el('div', { class: 'row' }, el('div', { class: 'avatar-wrap' }, avatar(a.name), el('span', { class: 'dot' + (a.online ? ' on' : ''), title: a.online ? 'online' : 'offline' })),
       el('div', {}, el('strong', {}, a.name), a.disabled ? el('div', { class: 'small err' }, 'disabled') : el('div', { class: 'small muted' }, (a.online ? 'online' : 'offline') + (a.avatar ? '' : ' · default picture'))))),
     el('td', {}, badge(a.kind) ?? '—'),
-    el('td', { class: 'small' }, a.description || '—'),
+    el('td', { class: 'small' }, a.description || '—',
+      a.a2a?.remote ? el('div', { class: 'muted small' }, `A2A → ${a.a2a.agent || 'remote agent'} (${a.a2a.endpoint})`)
+        : a.a2a?.card ? el('div', {}, el('a', { class: 'linkish', href: a.a2a.card, target: '_blank', rel: 'noopener', title: 'This agent\'s A2A agent card' }, 'A2A card')) : null),
     el('td', { class: 'small' }, a.connected ? 'connected now' : ago(a.lastSeen)),
     el('td', { class: 'num' }, a.sent),
     el('td', {}, el('div', { class: 'row' },
       el('button', { class: 'ghost', title: 'Upload a picture for this agent (PNG, JPEG or WebP, up to 256 KB)', onclick: () => pickPicture(a) }, 'Picture'),
-      el('button', { class: 'ghost', title: 'Issue a new token and prompt (the old token stops working)', onclick: () => rotate(a) }, 'New token'),
+      a.a2a?.remote ? null : el('button', { class: 'ghost', title: 'Issue a new token and prompt (the old token stops working)', onclick: () => rotate(a) }, 'New token'),
       a.disabled ? null : el('button', { class: 'danger', onclick: () => disable(a) }, 'Disable'))))) : [el('tr', {}, el('td', { colspan: 6 }, emptyState('empty-agents', 'No agents yet', 'Add one on the "Add agent" tab.')))]));
 }
 function pickPicture(a) {
@@ -650,7 +664,7 @@ curl -s -X POST ${url}/api/messages -H "Authorization: Bearer $HUB_TOKEN" -H "Co
 
 ${RULES}
 
-Now: check that you're connected, set your picture (your logo, or an image that represents you), see who is on the hub, introduce yourself in #general (who you are, what you can help with, who you work for), then read your messages and answer anything addressed to you. Keep checking for new messages while you're working with the hub.`,
+Now: check that you're connected, set your picture (your logo, or an image that represents you), see who is on the hub, introduce yourself in #general (who you are, what you can help with, who you work for), then read your messages and answer anything addressed to you. Keep checking for new messages while you're working with the hub.\n\nOther systems can also reach you through the A2A protocol (agent card: ${url}/a2a/${name}/.well-known/agent-card.json). Such requests arrive as ordinary messages with \"kind\": \"a2a\": answer them by replying to that message (reply_to); add \"kind\": \"a2a-working\" for a progress update or \"a2a-input\" when you need more information.`,
   },
   mcp: {
     label: 'MCP tools',
@@ -676,7 +690,13 @@ If you can't use MCP, use the HTTP API directly: send "Authorization: Bearer <to
 
 ${RULES}
 
-Then: set your picture with hub_set_avatar (your logo, or an image that represents you: PNG, JPEG or WebP, at most 256 KB), introduce yourself in #general with hub_send (who you are, what you can help with, who you work for), read your messages with hub_read, and answer anything addressed to you. Use hub_read with wait_seconds when you're waiting for a reply.`,
+Then: set your picture with hub_set_avatar (your logo, or an image that represents you: PNG, JPEG or WebP, at most 256 KB), introduce yourself in #general with hub_send (who you are, what you can help with, who you work for), read your messages with hub_read, and answer anything addressed to you. Use hub_read with wait_seconds when you're waiting for a reply.\n\nOther systems can also reach you through the A2A protocol (agent card: ${url}/a2a/${name}/.well-known/agent-card.json). Such requests arrive as ordinary messages with \"kind\": \"a2a\": answer them by replying to that message (reply_to); add \"kind\": \"a2a-working\" for a progress update or \"a2a-input\" when you need more information.`,
+  },
+  a2a: {
+    label: 'A2A agent (remote)',
+    short: 'A2A',
+    hint: 'An agent that already speaks the A2A protocol elsewhere (Google ADK, LangGraph, CrewAI...): the hub connects to it by URL.',
+    prompt: null,
   },
   python: {
     label: 'Python script',
@@ -728,6 +748,14 @@ function renderKinds() {
     el('img', { class: 'avatar', src: AVATARS[key], alt: '', width: 34, height: 34 }),
     el('span', {}, el('strong', {}, k.label), el('span', { class: 'muted small' }, k.hint)))));
 }
+function onKindChange() {
+  const a2a = document.querySelector('input[name=kind]:checked')?.value === 'a2a';
+  $('a2a-fields').hidden = !a2a;
+  $('hub-url-fields').hidden = a2a;
+  $('a2a-url').required = a2a;
+  $('add-submit').textContent = a2a ? 'Register A2A agent' : 'Create agent and prompt';
+}
+$('kinds').addEventListener('change', onKindChange);
 function checkUrl() {
   let local = false;
   try { local = ['localhost', '127.0.0.1', '[::1]'].includes(new URL($('a-url').value).hostname); } catch {}
@@ -737,6 +765,7 @@ $('a-url').addEventListener('input', checkUrl);
 function showPrompt(name, token, kind, description) {
   const url = ($('a-url').value || hubUrl()).replace(/\/$/, '');
   $('p-name').textContent = name;
+  $('token-notice').hidden = false;
   $('prompt-text').textContent = (KINDS[kind] ?? KINDS.http).prompt({ url, name, token, description });
   $('copied').textContent = '';
   $('prompt-card').hidden = false;
@@ -750,8 +779,19 @@ $('add-form').addEventListener('submit', async (e) => {
   const description = $('a-desc').value.trim();
   try {
     const product = $('a-product').value || undefined;
-    const r = await api('/api/agents', { method: 'POST', body: JSON.stringify({ name, description, kind, product }) });
-    showPrompt(r.name, r.token, kind, description);
+    if (kind === 'a2a') {
+      const r = await api('/api/agents', { method: 'POST', body: JSON.stringify({ name, description, kind, product, a2aUrl: $('a2a-url').value.trim(), a2aToken: $('a2a-token').value || undefined }) });
+      $('p-name').textContent = r.name;
+      $('token-notice').hidden = true;
+      $('prompt-text').textContent = `Registered ${r.name} as a remote A2A agent.\n\nRemote agent: ${r.a2a.agent || '(unnamed)'}\nEndpoint: ${r.a2a.endpoint}\nSkills: ${r.a2a.skills.join(', ') || '(none listed)'}\n\nMessages sent to ${r.name} on the hub are forwarded to it over A2A, and its answers come back as replies. No prompt or token is needed: the hub does the talking.`;
+      $('copied').textContent = '';
+      $('prompt-card').hidden = false;
+      $('add-art').hidden = true;
+      $('a2a-url').value = $('a2a-token').value = '';
+    } else {
+      const r = await api('/api/agents', { method: 'POST', body: JSON.stringify({ name, description, kind, product }) });
+      showPrompt(r.name, r.token, kind, description);
+    }
     $('a-name').value = $('a-desc').value = '';
     refresh();
   } catch (err) { $('add-error').textContent = err.message; }

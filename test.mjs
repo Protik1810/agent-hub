@@ -19,6 +19,8 @@ const call = async (token, method, p, body) => {
   return { status: res.status, data: await res.json() };
 };
 let passed = 0;
+let eveTok = null;
+const eveToken = () => eveTok;
 const noHub = (r) => r.data.messages.filter((m) => m.from !== 'hub'); // the hub's own welcome messages
 
 const check = async (name, fn) => {
@@ -52,7 +54,7 @@ try {
     assert.equal(m.status, 200);
     assert.equal(noHub(await call(hades, 'GET', '/api/messages?since=0')).length, 1);
     await call(ADMIN, 'POST', '/api/agents', { name: 'eve' });
-    const eve = (await call(ADMIN, 'POST', '/api/agents/eve/rotate')).data.token;
+    const eve = (eveTok = (await call(ADMIN, 'POST', '/api/agents/eve/rotate')).data.token);
     assert.equal(noHub(await call(eve, 'GET', '/api/messages?since=0')).length, 0);
     assert.equal(noHub(await call(ADMIN, 'GET', '/api/messages?since=0')).length, 1);
   });
@@ -154,6 +156,105 @@ try {
     assert.equal((await call(ADMIN, 'PUT', '/api/agents/eve/avatar', { catalog: 'hermes' })).status, 200);
     assert.equal((await call(ADMIN, 'DELETE', '/api/catalog/hermes')).status, 200);
     assert.equal((await fetch(base + entry.data.image)).status, 404);
+  });
+  await check('A2A inbound: agent cards, message/send, replies complete tasks, streaming and cancel', async () => {
+    const oracle = (await call(ADMIN, 'POST', '/api/agents', { name: 'oracle', description: 'Answers questions' })).data.token;
+    const asker = (await call(ADMIN, 'POST', '/api/agents', { name: 'asker' })).data.token;
+    const card = await call(null, 'GET', '/a2a/oracle/.well-known/agent-card.json');
+    assert.equal(card.status, 200);
+    assert.equal(card.data.name, 'oracle');
+    assert.match(card.data.url, /\/a2a\/oracle$/);
+    assert.equal(card.data.capabilities.streaming, true);
+    assert.equal((await call(null, 'GET', '/a2a')).status, 200);
+    const rpc = (token, method, params) => call(token, 'POST', '/a2a/oracle', { jsonrpc: '2.0', id: 7, method, params });
+    assert.equal((await rpc(null, 'message/send', {})).status, 401);
+    const msg = (text, extra = {}) => ({ message: { kind: 'message', role: 'user', messageId: 'm-' + Math.random(), parts: [{ kind: 'text', text }], ...extra } });
+    // non-blocking send: the task waits for hades
+    const sent = await rpc(asker, 'message/send', { ...msg('What is 2 + 2?'), configuration: { blocking: false } });
+    assert.equal(sent.data.id, 7);
+    const task = sent.data.result;
+    assert.equal(task.kind, 'task');
+    assert.equal(task.status.state, 'submitted');
+    // hades sees it as an ordinary hub message and replies to it
+    const inbox = (await call(oracle, 'GET', '/api/messages?since=0&limit=500')).data.messages;
+    const request = inbox.filter((m) => m.kind === 'a2a' && m.from === 'asker').at(-1);
+    assert.equal(request.body, 'What is 2 + 2?');
+    await call(oracle, 'POST', '/api/messages', { to: 'asker', body: 'Four.', reply_to: request.id });
+    const done = (await rpc(asker, 'tasks/get', { id: task.id })).data.result;
+    assert.equal(done.status.state, 'completed');
+    assert.equal(done.status.message.parts[0].text, 'Four.');
+    assert.equal(done.artifacts[0].parts[0].text, 'Four.');
+    assert.equal(done.history.length, 2);
+    assert.equal((await rpc(eveToken(), 'tasks/get', { id: task.id })).data.error.code, -32001);
+    // blocking send returns once the answer arrives
+    const blocking = rpc(asker, 'message/send', msg('Ping?'));
+    setTimeout(async () => {
+      const r = (await call(oracle, 'GET', '/api/messages?since=0&limit=500')).data.messages.filter((m) => m.kind === 'a2a').at(-1);
+      call(oracle, 'POST', '/api/messages', { to: 'asker', body: 'Pong.', reply_to: r.id });
+    }, 300);
+    const answered = (await blocking).data.result;
+    assert.equal(answered.status.state, 'completed');
+    assert.equal(answered.status.message.parts[0].text, 'Pong.');
+    // streaming: the task, then a final status update
+    const streamRes = await fetch(base + '/a2a/oracle', { method: 'POST', headers: { authorization: `Bearer ${asker}`, 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 9, method: 'message/stream', params: msg('Stream me') }) });
+    assert.equal(streamRes.headers.get('content-type'), 'text/event-stream');
+    setTimeout(async () => {
+      const r = (await call(oracle, 'GET', '/api/messages?since=0&limit=500')).data.messages.filter((m) => m.kind === 'a2a').at(-1);
+      call(oracle, 'POST', '/api/messages', { to: 'asker', body: 'Streamed.', reply_to: r.id });
+    }, 300);
+    const events = (await streamRes.text()).split('\n\n').filter((e) => e.startsWith('data: ')).map((e) => JSON.parse(e.slice(6)).result);
+    assert.equal(events[0].kind, 'task');
+    assert.equal(events.at(-1).kind, 'status-update');
+    assert.equal(events.at(-1).final, true);
+    assert.equal(events.at(-1).status.message.parts[0].text, 'Streamed.');
+    // cancel
+    const pending = (await rpc(asker, 'message/send', { ...msg('Never mind'), configuration: { blocking: false } })).data.result;
+    assert.equal((await rpc(asker, 'tasks/cancel', { id: pending.id })).data.result.status.state, 'canceled');
+    assert.equal((await rpc(asker, 'tasks/cancel', { id: pending.id })).data.error.code, -32002);
+    assert.equal((await rpc(asker, 'nonsense/method', {})).data.error.code, -32601);
+  });
+  await check('A2A outbound: a remote A2A agent registered by URL gets hub messages and replies', async () => {
+    const http = await import('node:http');
+    const seen = [];
+    const remote = http.createServer(async (req, res) => {
+      const port = remote.address().port;
+      if (req.method === 'GET' && req.url === '/.well-known/agent-card.json') {
+        res.setHeader('content-type', 'application/json');
+        return res.end(JSON.stringify({ name: 'Echo', description: 'Echoes text', url: `http://127.0.0.1:${port}/rpc`, protocolVersion: '0.3.0', capabilities: {}, skills: [{ id: 'echo', name: 'Echo' }] }));
+      }
+      let body = '';
+      for await (const c of req) body += c;
+      const rpcReq = JSON.parse(body);
+      seen.push({ auth: req.headers.authorization, method: rpcReq.method, text: rpcReq.params?.message?.parts?.[0]?.text });
+      const text = rpcReq.params.message.parts[0].text;
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ jsonrpc: '2.0', id: rpcReq.id, result: { kind: 'task', id: 't1', contextId: 'c1', status: { state: 'completed', message: { kind: 'message', role: 'agent', messageId: 'x', parts: [{ kind: 'text', text: `echo: ${text}` }] } }, artifacts: [] } }));
+    });
+    await new Promise((r) => remote.listen(0, '127.0.0.1', r));
+    try {
+      const port = remote.address().port;
+      const reg = await call(ADMIN, 'POST', '/api/agents', { name: 'echo', kind: 'a2a', a2aUrl: `http://127.0.0.1:${port}`, a2aToken: 'remote-secret' });
+      assert.equal(reg.status, 201);
+      assert.equal(reg.data.a2a.agent, 'Echo');
+      assert.equal((await call(ADMIN, 'POST', '/api/agents', { name: 'nowhere', kind: 'a2a', a2aUrl: 'http://127.0.0.1:1' })).status, 502);
+      const listed = (await call(ADMIN, 'GET', '/api/agents')).data.agents.find((a) => a.name === 'echo');
+      assert.equal(listed.kind, 'a2a');
+      assert.equal(listed.a2a.remote, true);
+      assert(!JSON.stringify(listed).includes('remote-secret'), 'the remote token is never shown');
+      const sent = (await call(claude, 'POST', '/api/messages', { to: 'echo', body: 'hello remote' })).data;
+      let reply;
+      for (let i = 0; i < 40 && !reply; i++) {
+        await new Promise((r) => setTimeout(r, 100));
+        reply = (await call(claude, 'GET', `/api/messages?since=${sent.id}`)).data.messages.find((m) => m.reply_to === sent.id);
+      }
+      assert.equal(reply.from, 'echo');
+      assert.equal(reply.body, 'echo: hello remote');
+      assert.equal(seen[0].method, 'message/send');
+      assert.equal(seen[0].auth, 'Bearer remote-secret');
+      assert.equal((await call(claude, 'POST', '/a2a/echo', { jsonrpc: '2.0', id: 1, method: 'message/send', params: { message: { parts: [{ kind: 'text', text: 'x' }] } } })).data.error.code, -32004);
+    } finally {
+      remote.close();
+    }
   });
   await check('presence: an agent waiting for messages counts as connected and online', async () => {
     const waiting = call(hades, 'GET', '/api/messages?since=999999&wait=3');
