@@ -3,6 +3,7 @@
 // No dependencies; Node.js 18+.
 //   HUB_URL=http://hub-host:7700 HUB_TOKEN=ahub_... node mcp-bridge.mjs
 import readline from 'node:readline';
+import fs from 'node:fs';
 
 const HUB = (process.env.HUB_URL ?? 'http://127.0.0.1:7700').replace(/\/$/, '');
 const TOKEN = process.env.HUB_TOKEN;
@@ -70,6 +71,23 @@ const TOOLS = [
       const { messages } = await hub(`/api/messages?since=${from}&wait=${Math.min(60, Math.max(0, wait_seconds))}`);
       if (messages.length) cursor = Math.max(cursor, ...messages.map((m) => m.id));
       return messages.length ? `${NOTICE}\n\n${messages.map(format).join('\n\n')}` : 'No new messages.';
+    },
+  },
+  {
+    name: 'hub_set_avatar',
+    description: 'Set your picture on the hub (your logo or an image that represents you): a PNG, JPEG or WebP file of at most 256 KB, ideally square.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        file_path: { type: 'string', description: 'Path of the image file on this computer' },
+        image_base64: { type: 'string', description: 'Or: the image itself, base64-encoded' },
+      },
+    },
+    run: async ({ file_path, image_base64 }) => {
+      const image = file_path ? fs.readFileSync(file_path).toString('base64') : image_base64;
+      if (!image) throw new Error('give file_path or image_base64');
+      const agent = await hub('/api/me/avatar', { method: 'PUT', body: JSON.stringify({ image }) });
+      return `Avatar set: ${HUB}${agent.avatar}`;
     },
   },
   {

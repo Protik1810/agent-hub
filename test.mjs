@@ -19,6 +19,8 @@ const call = async (token, method, p, body) => {
   return { status: res.status, data: await res.json() };
 };
 let passed = 0;
+const noHub = (r) => r.data.messages.filter((m) => m.from !== 'hub'); // the hub's own welcome messages
+
 const check = async (name, fn) => {
   await fn();
   passed++;
@@ -48,11 +50,11 @@ try {
   await check('direct messages are private to sender, recipient and admin', async () => {
     const m = await call(claude, 'POST', '/api/messages', { to: 'hades', body: 'Hi Hades, Solframe is at 192.168.1.10:8765' });
     assert.equal(m.status, 200);
-    assert.equal((await call(hades, 'GET', '/api/messages?since=0')).data.messages.length, 1);
+    assert.equal(noHub(await call(hades, 'GET', '/api/messages?since=0')).length, 1);
     await call(ADMIN, 'POST', '/api/agents', { name: 'eve' });
     const eve = (await call(ADMIN, 'POST', '/api/agents/eve/rotate')).data.token;
-    assert.equal((await call(eve, 'GET', '/api/messages?since=0')).data.messages.length, 0);
-    assert.equal((await call(ADMIN, 'GET', '/api/messages?since=0')).data.messages.length, 1);
+    assert.equal(noHub(await call(eve, 'GET', '/api/messages?since=0')).length, 0);
+    assert.equal(noHub(await call(ADMIN, 'GET', '/api/messages?since=0')).length, 1);
   });
   await check('channels: #general for everyone, others by joining', async () => {
     await call(hades, 'POST', '/api/messages', { to: '#general', body: 'hello all' });
@@ -103,6 +105,29 @@ try {
     for (const bad of ['/assets/../server.mjs', '/assets/%2e%2e/server.mjs', '/assets/..%5Cserver.mjs', '/assets/missing.webp', '/assets/test.mjs'])
       assert.equal((await fetch(base + bad)).status, 404, bad);
   });
+  await check('new agents are asked for a picture once; avatars are validated, public and replaceable', async () => {
+    const t = (await call(ADMIN, 'POST', '/api/agents', { name: 'painter' })).data.token;
+    const first = (await call(t, 'GET', '/api/messages?since=0')).data.messages.filter((m) => m.from === 'hub');
+    assert.equal(first.length, 1);
+    assert.match(first[0].body, /PUT \/api\/me\/avatar/);
+    await call(t, 'GET', '/api/me');
+    assert.equal((await call(t, 'GET', '/api/messages?since=0')).data.messages.filter((m) => m.from === 'hub').length, 1, 'asked only once');
+    const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+    const set = await call(t, 'PUT', '/api/me/avatar', { image: 'data:image/png;base64,' + png });
+    assert.equal(set.status, 200);
+    assert.match(set.data.avatar, /^\/avatars\/painter\?v=\d+$/);
+    const pic = await fetch(base + set.data.avatar);
+    assert.equal(pic.status, 200);
+    assert.equal(pic.headers.get('content-type'), 'image/png');
+    const svg = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>').toString('base64');
+    assert.equal((await call(t, 'PUT', '/api/me/avatar', { image: svg })).status, 415);
+    assert.equal((await call(t, 'PUT', '/api/me/avatar', { image: Buffer.alloc(300 * 1024, 1).toString('base64') })).status, 413);
+    assert.equal((await call(t, 'PUT', '/api/agents/hades/avatar', { image: png })).status, 403);
+    assert.equal((await call(ADMIN, 'PUT', '/api/agents/hades/avatar', { image: png })).status, 200);
+    assert.equal((await call(t, 'DELETE', '/api/me/avatar')).data.avatar, null);
+    assert.equal((await fetch(base + '/avatars/painter')).status, 404);
+    assert.equal((await fetch(base + '/avatars/..%2Fhub.json')).status, 404);
+  });
   await check('presence: an agent waiting for messages counts as connected and online', async () => {
     const waiting = call(hades, 'GET', '/api/messages?since=999999&wait=3');
     await new Promise((r) => setTimeout(r, 300));
@@ -144,7 +169,7 @@ try {
     assert.equal(init.result.serverInfo.name, 'agent-hub');
     bridge.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
     const tools = (await rpc('tools/list')).result.tools.map((t) => t.name);
-    assert.deepEqual(tools, ['hub_whoami', 'hub_list_agents', 'hub_send', 'hub_read', 'hub_join_channel', 'hub_leave_channel']);
+    assert.deepEqual(tools, ['hub_whoami', 'hub_list_agents', 'hub_send', 'hub_read', 'hub_set_avatar', 'hub_join_channel', 'hub_leave_channel']);
     const sent = await rpc('tools/call', { name: 'hub_send', arguments: { to: 'hades', body: 'sent through MCP' } });
     assert.match(sent.result.content[0].text, /Sent message #\d+ to hades/);
     const read = await rpc('tools/call', { name: 'hub_read', arguments: {} });

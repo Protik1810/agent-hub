@@ -14,7 +14,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
-const VERSION = '1.2.0';
+const VERSION = '1.3.0';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const HOST = process.env.HUB_HOST ?? '127.0.0.1';
 const PORT = Number(process.env.HUB_PORT ?? 7700);
@@ -106,7 +106,7 @@ function post(from, { to, body, reply_to, kind }) {
   if (reply_to !== undefined && reply_to !== null && !db.messages.some((m) => m.id === reply_to)) throw httpError(400, 'reply_to is not a known message id');
   const now = Date.now();
   const recent = (sent.get(from) ?? []).filter((t) => now - t < 60_000);
-  if (from !== 'admin' && recent.length >= RATE) throw httpError(429, `rate limit: ${RATE} messages per minute`);
+  if (from !== 'admin' && from !== 'hub' && recent.length >= RATE) throw httpError(429, `rate limit: ${RATE} messages per minute`);
   sent.set(from, [...recent, now]);
   const m = { id: db.nextId++, from, to, body, kind: typeof kind === 'string' ? kind.slice(0, 32) : 'text', reply_to: reply_to ?? null, ts: new Date(now).toISOString() };
   db.messages.push(m);
@@ -118,10 +118,54 @@ function post(from, { to, body, reply_to, kind }) {
 }
 
 function touch(name) {
-  if (db.agents[name]) {
-    db.agents[name].lastSeen = new Date().toISOString();
-    save();
+  const a = db.agents[name];
+  if (!a) return;
+  const firstVisit = !a.lastSeen;
+  a.lastSeen = new Date().toISOString();
+  save();
+  // The first time an agent connects without a picture, the hub asks it for one
+  if (firstVisit && !a.avatar && !a.avatarAsked) {
+    a.avatarAsked = true;
+    post('hub', { to: name, kind: 'system', body: AVATAR_REQUEST(name) });
   }
+}
+
+const AVATAR_REQUEST = (name) => `Welcome to Agent Hub, ${name}! Please give yourself a picture so people and agents can recognise you on the dashboard: your logo, or an image that represents you.
+
+Upload it with: PUT /api/me/avatar  {"image": "<base64 of a PNG, JPEG or WebP image>"}  (square works best, at least 128x128 pixels, at most 256 KB; data: URLs are accepted too). If you use the MCP bridge, call hub_set_avatar with the image file's path.
+
+Until then you're shown with a default picture for your kind of agent.`;
+
+// ---------- avatars ----------
+const AVATARS = path.join(DATA, 'avatars');
+fs.mkdirSync(AVATARS, { recursive: true });
+const MAX_AVATAR = 256 * 1024;
+/** The image type from the file's first bytes (never trust a name or a declared type; SVG is refused because it can contain scripts). */
+function imageType(buf) {
+  if (buf.length > 8 && buf.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return { ext: 'png', type: 'image/png' };
+  if (buf.length > 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return { ext: 'jpg', type: 'image/jpeg' };
+  if (buf.length > 12 && buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WEBP') return { ext: 'webp', type: 'image/webp' };
+  return null;
+}
+function setAvatar(name, image) {
+  if (typeof image !== 'string' || !image) throw httpError(400, 'send {"image": "<base64 PNG, JPEG or WebP>"}');
+  const buf = Buffer.from(image.replace(/^data:image\/[\w.+-]+;base64,/, ''), 'base64');
+  if (buf.length > MAX_AVATAR) throw httpError(413, `the image is larger than ${MAX_AVATAR / 1024} KB`);
+  const kind = imageType(buf);
+  if (!kind) throw httpError(415, 'the image must be a PNG, JPEG or WebP file');
+  const a = db.agents[name];
+  for (const ext of ['png', 'jpg', 'webp']) fs.rmSync(path.join(AVATARS, `${name}.${ext}`), { force: true });
+  fs.writeFileSync(path.join(AVATARS, `${name}.${kind.ext}`), buf);
+  a.avatar = { ext: kind.ext, type: kind.type, updated: Date.now() };
+  save();
+  return publicAgent(name, a);
+}
+function clearAvatar(name) {
+  const a = db.agents[name];
+  for (const ext of ['png', 'jpg', 'webp']) fs.rmSync(path.join(AVATARS, `${name}.${ext}`), { force: true });
+  delete a.avatar;
+  save();
+  return publicAgent(name, a);
 }
 
 const publicAgent = (name, a) => ({
@@ -135,6 +179,7 @@ const publicAgent = (name, a) => ({
   connected: connected(name),
   sent: a.sent ?? 0,
   disabled: !!a.disabled,
+  avatar: a.avatar ? `/avatars/${name}?v=${a.avatar.updated}` : null,
 });
 
 // ---------- HTTP ----------
@@ -145,12 +190,12 @@ function send(res, status, data) {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
   res.end(JSON.stringify(data));
 }
-async function readJson(req) {
+async function readJson(req, limit = MAX_REQUEST) {
   let size = 0;
   const chunks = [];
   for await (const c of req) {
     size += c.length;
-    if (size > MAX_REQUEST) throw httpError(413, 'request too large');
+    if (size > limit) throw httpError(413, 'request too large');
     chunks.push(c);
   }
   if (!chunks.length) return {};
@@ -243,6 +288,21 @@ route('DELETE', '/api/agents/([a-z0-9_-]+)', ({ me, params }) => {
   return { ok: true };
 });
 
+// Avatars: an agent sets its own; the admin can set anyone's (base64 grows data by a third, hence the larger limit)
+route('PUT', '/api/me/avatar', async ({ me, req }) => {
+  if (me.admin) throw httpError(400, 'the admin has no avatar: use PUT /api/agents/<name>/avatar');
+  return setAvatar(me.name, (await readJson(req, MAX_AVATAR * 1.5)).image);
+});
+route('DELETE', '/api/me/avatar', ({ me }) => {
+  if (me.admin) throw httpError(400, 'the admin has no avatar');
+  return clearAvatar(me.name);
+});
+route('PUT', '/api/agents/([a-z0-9_-]+)/avatar', async ({ me, req, params }) => {
+  if (!me.admin) throw httpError(403, 'admin only (agents use PUT /api/me/avatar)');
+  if (!db.agents[params[0]]) throw httpError(404, 'no such agent');
+  return setAvatar(params[0], (await readJson(req, MAX_AVATAR * 1.5)).image);
+});
+
 route('PATCH', '/api/me', async ({ me, req }) => {
   if (me.admin) throw httpError(400, 'the admin has no profile');
   const { description } = await readJson(req);
@@ -331,6 +391,14 @@ const server = http.createServer(async (req, res) => {
       if (!type || !/^[\w./-]+$/.test(name) || name.includes('..') || !file.startsWith(ASSETS + path.sep) || !fs.existsSync(file)) throw httpError(404, 'not found');
       res.writeHead(200, { 'content-type': type, 'cache-control': 'public, max-age=86400', 'x-content-type-options': 'nosniff' });
       return fs.createReadStream(file).pipe(res);
+    }
+    // Agents' pictures are public, like the dashboard's own images
+    const pic = req.method === 'GET' && url.pathname.match(/^\/avatars\/([a-z0-9_-]+)$/);
+    if (pic) {
+      const a = db.agents[pic[1]];
+      if (!a?.avatar) throw httpError(404, 'not found');
+      res.writeHead(200, { 'content-type': a.avatar.type, 'cache-control': 'public, max-age=86400', 'x-content-type-options': 'nosniff', 'content-security-policy': "default-src 'none'" });
+      return fs.createReadStream(path.join(AVATARS, `${pic[1]}.${a.avatar.ext}`)).pipe(res);
     }
     // The MCP bridge contains no secrets: agents download it from here
     if (req.method === 'GET' && url.pathname === '/mcp-bridge.mjs') {

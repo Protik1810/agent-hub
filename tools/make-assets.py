@@ -20,7 +20,12 @@ SIZES = {
     "avatar-http": (128, 128),
     "avatar-mcp": (128, 128),
     "avatar-script": (128, 128),
+    "bg-dark": (1920, 1088),
+    "bg-light": (1920, 1088),
 }
+
+# Emblems for the first hub's agents: uploaded as their pictures, not part of the dashboard
+AGENT_EMBLEMS = ["agent-claude", "agent-hades", "agent-antigravity"]
 
 OUT.mkdir(exist_ok=True)
 for name, size in SIZES.items():
@@ -33,6 +38,13 @@ for name, size in SIZES.items():
     dest = OUT / f"{name}.webp"
     img.save(dest, "WEBP", quality=82, method=6)
     print(f"ok {dest.name} {size[0]}x{size[1]} {dest.stat().st_size // 1024} KB")
+
+for name in AGENT_EMBLEMS:
+    src = SRC / f"{name}.png"
+    if src.exists():
+        dest = SRC / f"{name}.webp"
+        Image.open(src).convert("RGB").resize((256, 256), Image.LANCZOS).save(dest, "WEBP", quality=85, method=6)
+        print(f"ok {dest.name} 256x256 (upload with PUT /api/agents/<name>/avatar)")
 
 # A small favicon from the logo
 logo = SRC / "logo-mark.png"

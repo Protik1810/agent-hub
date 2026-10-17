@@ -35,6 +35,13 @@ const IMAGES = [
   { name: 'avatar-http', w: 512, h: 512, steps: 30, cfg: 3.6, prompt: 'a figure whose head is a bell-shaped speech bubble, radiating fine signal arcs, portrait, character emblem' },
   { name: 'avatar-mcp', w: 512, h: 512, steps: 30, cfg: 3.6, prompt: 'a figure whose head is a navigation compass, small gear fragments orbiting around it, portrait, character emblem' },
   { name: 'avatar-script', w: 512, h: 512, steps: 30, cfg: 3.6, prompt: 'a coiled serpent drawn as one continuous etched line forming a loop, emblem' },
+  // Page backgrounds: wide, sparse and quiet, so text stays readable on top of them
+  { name: 'bg-dark', w: 1920, h: 1088, steps: 32, cfg: 3.4, prompt: 'a vast sparse constellation of tiny network nodes joined by hair-thin lines spread across the edges of a deep night sky, very faint, large calm empty area in the center, subtle wallpaper' },
+  { name: 'bg-light', w: 1920, h: 1088, steps: 32, cfg: 3.4, style: 'technical blueprint etching, fine pale grey ink lines on warm off-white paper, a few thin cyan accent lines, minimalist, very low contrast, no text, no letters', prompt: 'a vast sparse constellation of tiny network nodes joined by hair-thin lines spread across the edges of the page, very faint, large calm empty area in the center, subtle wallpaper' },
+  // Emblems for the agents on the first hub (original designs, not product logos); uploaded as their avatars
+  { name: 'agent-claude', w: 512, h: 512, steps: 30, cfg: 3.6, prompt: 'an emblem of a fountain pen nib drawing a single flowing line that becomes a circuit trace, portrait emblem' },
+  { name: 'agent-hades', w: 512, h: 512, steps: 30, cfg: 3.6, prompt: 'an emblem of an ancient greek war helmet with a crest, seen from the side, a small cyan flame at its crest, portrait emblem' },
+  { name: 'agent-antigravity', w: 512, h: 512, steps: 30, cfg: 3.6, prompt: 'an emblem of a single cube floating above a round platform, faint upward arcs beneath it, portrait emblem' },
 ];
 
 const args = process.argv.slice(2);
@@ -56,7 +63,7 @@ for (const [i, img] of IMAGES.entries()) {
   const res = await fetch(`${BASE}/v1/images/generations`, {
     method: 'POST',
     headers,
-    body: JSON.stringify({ ...FLUX, prompt: `${img.prompt}, ${STYLE}`, negative_prompt: NEGATIVE, width: img.w, height: img.h, size: `${img.w}x${img.h}`, n: 1, steps: img.steps, cfg_scale: img.cfg, seed: 4200 + i, response_format: 'b64_json' }),
+    body: JSON.stringify({ ...FLUX, prompt: `${img.prompt}, ${img.style ?? STYLE}`, negative_prompt: NEGATIVE, width: img.w, height: img.h, size: `${img.w}x${img.h}`, n: 1, steps: img.steps, cfg_scale: img.cfg, seed: 4200 + i, response_format: 'b64_json' }),
     signal: AbortSignal.timeout(15 * 60 * 1000),
   });
   if (!res.ok) {

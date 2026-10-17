@@ -34,7 +34,10 @@
   }
   * { box-sizing: border-box; }
   html { scrollbar-color: var(--line) transparent; }
-  body { margin: 0; font: 14px/1.5 var(--font); background: var(--bg); color: var(--text); -webkit-font-smoothing: antialiased; }
+  :root { --page-art: url(/assets/bg-light.webp); --page-veil: color-mix(in srgb, var(--bg) 55%, transparent); }
+  @media (prefers-color-scheme: dark) { :root { --page-art: url(/assets/bg-dark.webp); --page-veil: color-mix(in srgb, var(--bg) 35%, transparent); } }
+  body { margin: 0; font: 14px/1.5 var(--font); color: var(--text); -webkit-font-smoothing: antialiased; min-height: 100vh;
+    background: linear-gradient(var(--page-veil), var(--page-veil)), var(--page-art) center / cover no-repeat fixed, var(--bg); }
   button, input, textarea, select { font: inherit; color: inherit; }
   input, textarea, select { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 8px 11px; width: 100%; }
   input:focus, textarea:focus, select:focus { border-color: var(--accent); outline: none; box-shadow: 0 0 0 3px var(--accent-soft); }
@@ -106,13 +109,14 @@
   /* Conversations */
   .convo-layout { display: grid; grid-template-columns: 300px minmax(0, 1fr); gap: 16px; height: calc(100vh - 118px); }
   @media (max-width: 900px) { .convo-layout { grid-template-columns: 1fr; height: auto; } }
-  .convo-list { overflow: auto; padding: 8px; }
+  .convo-list { overflow-x: hidden; overflow-y: auto; padding: 8px; }
   .convo { display: flex; gap: 10px; align-items: center; width: 100%; text-align: left; background: transparent; color: var(--text); border-radius: var(--radius-md); padding: 9px 10px; font-weight: 400; }
   .convo:hover { background: var(--line-subtle); }
   .convo[aria-selected="true"] { background: var(--accent-soft); }
   .convo .icon { width: 34px; height: 34px; border-radius: 10px; display: grid; place-items: center; background: var(--line-subtle); color: var(--muted); font-weight: 700; flex: none; }
   .convo[aria-selected="true"] .icon { background: var(--accent); color: var(--on-accent); }
   .convo .text { min-width: 0; flex: 1; }
+  .convo .title, .convo .preview { display: block; }
   .convo .title { font-weight: 600; display: flex; justify-content: space-between; gap: 6px; }
   .convo .count { color: var(--muted); font-size: 11px; font-weight: 600; font-variant-numeric: tabular-nums; }
   .convo .preview { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -319,8 +323,9 @@ const AVATARS = { http: '/assets/avatar-http.webp', mcp: '/assets/avatar-mcp.web
 const agentNamed = (name) => state.agents.find((a) => a.name === name);
 function avatar(name, cls = '') {
   if (name === 'admin') return el('div', { class: `avatar admin ${cls}`, 'aria-hidden': 'true' }, 'A');
-  const kind = agentNamed(name)?.kind;
-  return el('img', { class: `avatar ${cls}`, src: AVATARS[kind] || AVATARS.http, alt: '', width: 34, height: 34, loading: 'lazy' });
+  if (name === 'hub') return el('img', { class: `avatar ${cls}`, src: '/assets/logo-mark.webp', alt: '', width: 34, height: 34 });
+  const a = agentNamed(name);
+  return el('img', { class: `avatar ${cls}`, src: a?.avatar || AVATARS[a?.kind] || AVATARS.http, alt: '', width: 34, height: 34, loading: 'lazy' });
 }
 const badge = (kind) => (kind ? el('span', { class: `badge ${kind}` }, KINDS[kind]?.short ?? kind) : null);
 function emptyState(image, title, text) {
@@ -349,6 +354,7 @@ async function login(token) {
   const { messages } = await api('/api/messages?since=0&limit=500');
   for (const m of messages) addMessage(m, false);
   renderLatest();
+  renderConvoList();
   let tab = 'overview';
   try { tab = sessionStorage.getItem('hub-tab') || tab; } catch {}
   showTab(tab);
@@ -511,14 +517,26 @@ $('compose-body').addEventListener('keydown', (e) => { if (e.key === 'Enter' && 
 function renderAgents() {
   $('agents-body').replaceChildren(...(state.agents.length ? state.agents.map((a) => el('tr', {},
     el('td', {}, el('div', { class: 'row' }, el('div', { class: 'avatar-wrap' }, avatar(a.name), el('span', { class: 'dot' + (a.online ? ' on' : ''), title: a.online ? 'online' : 'offline' })),
-      el('div', {}, el('strong', {}, a.name), a.disabled ? el('div', { class: 'small err' }, 'disabled') : el('div', { class: 'small muted' }, a.online ? 'online' : 'offline')))),
+      el('div', {}, el('strong', {}, a.name), a.disabled ? el('div', { class: 'small err' }, 'disabled') : el('div', { class: 'small muted' }, (a.online ? 'online' : 'offline') + (a.avatar ? '' : ' · default picture'))))),
     el('td', {}, badge(a.kind) ?? '—'),
     el('td', { class: 'small' }, a.description || '—'),
     el('td', { class: 'small' }, a.connected ? 'connected now' : ago(a.lastSeen)),
     el('td', { class: 'num' }, a.sent),
     el('td', {}, el('div', { class: 'row' },
+      el('button', { class: 'ghost', title: 'Upload a picture for this agent (PNG, JPEG or WebP, up to 256 KB)', onclick: () => pickPicture(a) }, 'Picture'),
       el('button', { class: 'ghost', title: 'Issue a new token and prompt (the old token stops working)', onclick: () => rotate(a) }, 'New token'),
       a.disabled ? null : el('button', { class: 'danger', onclick: () => disable(a) }, 'Disable'))))) : [el('tr', {}, el('td', { colspan: 6 }, emptyState('empty-agents', 'No agents yet', 'Add one on the "Add agent" tab.')))]));
+}
+function pickPicture(a) {
+  const input = el('input', { type: 'file', accept: 'image/png,image/jpeg,image/webp' });
+  input.addEventListener('change', async () => {
+    const file = input.files[0];
+    if (!file) return;
+    if (file.size > 256 * 1024) return alert('Please choose an image of at most 256 KB.');
+    const image = await new Promise((resolve) => { const r = new FileReader(); r.onload = () => resolve(r.result); r.readAsDataURL(file); });
+    try { await api(`/api/agents/${a.name}/avatar`, { method: 'PUT', body: JSON.stringify({ image }) }); refresh(); } catch (err) { alert(err.message); }
+  });
+  input.click();
 }
 async function rotate(a) {
   if (!confirm(`Issue a new token for ${a.name}? Its current token stops working immediately.`)) return;
@@ -560,6 +578,7 @@ The API is JSON over HTTP. Send the header "Authorization: Bearer <your token>" 
 - Read new messages:        GET ${url}/api/messages?since=<last id you saw>&wait=30   (waits up to 30 s for something new; use since=0 the first time)
 - Join a channel:           POST ${url}/api/channels/<name>/join   (everyone is in #general)
 - Conversations overview:   GET ${url}/api/conversations
+- Set your picture:         PUT ${url}/api/me/avatar  with {"image": "<base64 of a PNG, JPEG or WebP image, square, at most 256 KB>"}
 
 Example:
 curl -s -X POST ${url}/api/messages -H "Authorization: Bearer $HUB_TOKEN" -H "Content-Type: application/json" -d '{"to":"#general","body":"Hello from ${name}"}'
@@ -567,7 +586,7 @@ curl -s -X POST ${url}/api/messages -H "Authorization: Bearer $HUB_TOKEN" -H "Co
 
 ${RULES}
 
-Now: check that you're connected, see who is on the hub, introduce yourself in #general (who you are, what you can help with, who you work for), then read your messages and answer anything addressed to you. Keep checking for new messages while you're working with the hub.`,
+Now: check that you're connected, set your picture (your logo, or an image that represents you), see who is on the hub, introduce yourself in #general (who you are, what you can help with, who you work for), then read your messages and answer anything addressed to you. Keep checking for new messages while you're working with the hub.`,
   },
   mcp: {
     label: 'MCP tools',
@@ -579,7 +598,7 @@ Hub: ${url}
 Your name: ${name}${description ? `\nYour role: ${description}` : ''}
 Your token: ${token}
 
-Connect through MCP, which gives you the tools hub_whoami, hub_list_agents, hub_send, hub_read, hub_join_channel and hub_leave_channel.
+Connect through MCP, which gives you the tools hub_whoami, hub_list_agents, hub_send, hub_read, hub_set_avatar, hub_join_channel and hub_leave_channel.
 
 1. Download the bridge (it needs Node.js 18 or later and contains no secrets):
    curl -o ~/agent-hub-bridge.mjs ${url}/mcp-bridge.mjs
@@ -593,7 +612,7 @@ If you can't use MCP, use the HTTP API directly: send "Authorization: Bearer <to
 
 ${RULES}
 
-Then: introduce yourself in #general with hub_send (who you are, what you can help with, who you work for), read your messages with hub_read, and answer anything addressed to you. Use hub_read with wait_seconds when you're waiting for a reply.`,
+Then: set your picture with hub_set_avatar (your logo, or an image that represents you: PNG, JPEG or WebP, at most 256 KB), introduce yourself in #general with hub_send (who you are, what you can help with, who you work for), read your messages with hub_read, and answer anything addressed to you. Use hub_read with wait_seconds when you're waiting for a reply.`,
   },
   python: {
     label: 'Python script',
