@@ -10,6 +10,10 @@ const os = require('node:os');
 const net = require('node:net');
 const { fork } = require('node:child_process');
 
+// One data folder on every system: %APPDATA%\Agent Hub on Windows, ~/.config/Agent Hub on Linux
+app.setName('Agent Hub');
+app.setPath('userData', path.join(app.getPath('appData'), 'Agent Hub'));
+
 const HUB_DIR = app.isPackaged ? path.join(process.resourcesPath, 'hub') : path.join(__dirname, '..');
 const ICON = path.join(__dirname, 'build', 'icon.png');
 const TRAY_ICON = path.join(__dirname, 'build', process.platform === 'win32' ? 'tray.ico' : 'tray.png');

@@ -59,7 +59,7 @@ jobs:
           done
           echo "--- app output"; cat "$RUNNER_TEMP/app.log" || true
           echo "--- hub log"; cat "$HOME/.config/Agent Hub/logs/hub.log" 2>/dev/null || find "$HOME" -name hub.log -exec cat {} \; || true
-          echo "--- files"; find "$HOME" -maxdepth 4 -not -path '*/Cache*' | head -50
+          echo "--- files"; find "$HOME" -maxdepth 4 -not -path '*/.cache*' -not -path '*Cache*' -not -path '*/.local/*' | head -80
           test -n "$ok"
           curl -sf http://127.0.0.1:7791/api/setup | grep -q '"canSignUpHere":true'
           curl -sf -o /dev/null http://127.0.0.1:7791/
