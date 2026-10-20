@@ -1,7 +1,7 @@
 {
   "name": "agent-hub-desktop",
   "productName": "Agent Hub",
-  "version": "1.10.0",
+  "version": "1.11.0",
   "description": "Agent Hub desktop app: the hub runs in the background and the dashboard opens in its own window",
   "author": "Protik",
   "license": "MIT",

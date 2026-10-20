@@ -14,6 +14,7 @@
 // Options (they override the environment): --host, --port, --data, --history, --public-url, --open (open the
 // dashboard in the default browser), --tls-cert / --tls-key (serve HTTPS with your own certificate; HUB_TLS_CERT,
 // HUB_TLS_KEY). HUB_EXTRA_URLS: more addresses the hub can be reached at (comma-separated, label=url), shown to the admin.
+// Files: HUB_MAX_FILE_MB (largest file, 4096), HUB_FILES_QUOTA_GB (all files together, 50).
 //
 // The first time, open the dashboard on the hub's own computer and create the hub's account (or use the setup code
 // printed below when the hub has no account yet). The desktop app (desktop/) runs this same file in the background.
@@ -26,7 +27,7 @@ import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
-const VERSION = '1.10.0';
+const VERSION = '1.11.0';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
 const option = (name) => {
@@ -313,7 +314,7 @@ function markSeen(name, messages) {
 }
 const sent = new Map(); // rate limiting: name -> timestamps
 
-function post(from, { to, body, reply_to, kind }) {
+function post(from, { to, body, reply_to, kind, file }) {
   if (typeof to !== 'string' || !(to.startsWith('#') ? NAME.test(to.slice(1)) : to === 'admin' || db.agents[to])) {
     throw httpError(400, `unknown recipient "${to}" (an agent name, "admin", or a #channel)`);
   }
@@ -326,7 +327,7 @@ function post(from, { to, body, reply_to, kind }) {
   const recent = (sent.get(from) ?? []).filter((t) => now - t < 60_000);
   if (from !== 'admin' && from !== 'hub' && recent.length >= RATE) throw httpError(429, `rate limit: ${RATE} messages per minute`);
   sent.set(from, [...recent, now]);
-  const m = { id: db.nextId++, from, to, body, kind: typeof kind === 'string' ? kind.slice(0, 32) : 'text', reply_to: reply_to ?? null, ts: new Date(now).toISOString() };
+  const m = { id: db.nextId++, from, to, body, kind: typeof kind === 'string' ? kind.slice(0, 32) : 'text', reply_to: reply_to ?? null, ts: new Date(now).toISOString(), ...(file ? { file } : {}) };
   db.messages.push(m);
   recordHistory(m);
   if (db.messages.length > MAX_MESSAGES) db.messages.splice(0, db.messages.length - MAX_MESSAGES);
@@ -822,6 +823,139 @@ route('POST', '/api/login-codes', ({ me }) => {
   return { code: newLoginCode(), expiresIn: 300 };
 });
 
+// ---------- files: agents (and the admin) send each other files of any kind ----------
+// A file is sent to an agent, a #channel or the admin, like a message, and only that conversation (and the admin)
+// can see and download it. Uploads stream straight to disk (PUT with the raw file as the body, so curl -T works and
+// large files never sit in memory); downloads support Range, so interrupted transfers can resume.
+const FILES = path.join(DATA, 'files');
+fs.mkdirSync(FILES, { recursive: true });
+db.files ??= {};
+const MAX_FILE = Number(process.env.HUB_MAX_FILE_MB ?? 4096) * 2 ** 20;
+const FILES_QUOTA = Number(process.env.HUB_FILES_QUOTA_GB ?? 50) * 2 ** 30;
+const FILE_RATE = 120; // files per agent per hour
+const fileUploads = new Map();
+const downloadTickets = new Map(); // ticket -> { id, expires }: lets a browser download without the token in the URL
+const publicFile = (id, f) => ({ id, name: f.name, size: f.size, sha256: f.sha256, type: f.type, from: f.from, to: f.to, note: f.note ?? null, created: f.created, downloads: f.downloads ?? 0, url: `/api/files/${id}` });
+const fileVisible = (name, f) => visible(name, { from: f.from, to: f.to });
+const filesTotal = () => Object.values(db.files).reduce((n, f) => n + f.size, 0);
+const humanSize = (n) => (n >= 2 ** 30 ? `${(n / 2 ** 30).toFixed(2)} GB` : n >= 2 ** 20 ? `${(n / 2 ** 20).toFixed(1)} MB` : n >= 1024 ? `${(n / 1024).toFixed(1)} KB` : `${n} bytes`);
+function cleanName(name) {
+  const base = String(name ?? '').split(/[\\/]/).pop().replace(/[\u0000-\u001f\u007f"<>|:*?]/g, '_').trim().slice(0, 200);
+  return base && base !== '.' && base !== '..' ? base : 'file';
+}
+
+route('PUT', '/api/files', async ({ me, req, url }) => {
+  const to = url.searchParams.get('to') ?? '';
+  const name = cleanName(url.searchParams.get('name'));
+  const note = (url.searchParams.get('note') ?? '').slice(0, 500) || null;
+  const reply = url.searchParams.get('reply_to');
+  // the same checks as a message to that recipient, before reading a single byte
+  if (!(to.startsWith('#') ? NAME.test(to.slice(1)) : to === 'admin' || db.agents[to])) throw httpError(400, `unknown recipient "${to}" (an agent name, "admin", or a #channel): add ?to=`);
+  if (to === me.name) throw httpError(400, 'you cannot send a file to yourself');
+  if (db.agents[to]?.kind === 'a2a') throw httpError(400, `${to} is a remote A2A agent: it can't download files from the hub`);
+  if (db.agents[me.name]?.removedFrom?.includes(to)) throw httpError(403, `the admin removed you from ${to}`);
+  const declared = Number(req.headers['content-length'] ?? NaN);
+  if (declared > MAX_FILE) throw httpError(413, `files can be at most ${humanSize(MAX_FILE)}`);
+  if (Number.isFinite(declared) && filesTotal() + declared > FILES_QUOTA) throw httpError(507, `the hub's file storage is full (${humanSize(FILES_QUOTA)}): ask the admin to delete old files`);
+  const now = Date.now();
+  const recent = (fileUploads.get(me.name) ?? []).filter((t) => now - t < 3_600_000);
+  if (!me.admin && recent.length >= FILE_RATE) throw httpError(429, `limit: ${FILE_RATE} files per hour`);
+  fileUploads.set(me.name, [...recent, now]);
+  const id = crypto.randomBytes(9).toString('hex');
+  const part = path.join(FILES, `${id}.part`);
+  const hash = crypto.createHash('sha256');
+  let size = 0;
+  try {
+    await new Promise((resolve, reject) => {
+      const out = fs.createWriteStream(part, { mode: 0o600 });
+      req.on('data', (chunk) => {
+        size += chunk.length;
+        if (size > MAX_FILE) { req.destroy(); out.destroy(); reject(httpError(413, `files can be at most ${humanSize(MAX_FILE)}`)); return; }
+        hash.update(chunk);
+        if (!out.write(chunk)) { req.pause(); out.once('drain', () => req.resume()); }
+      });
+      req.on('end', () => out.end(resolve));
+      req.on('error', reject);
+      req.on('aborted', () => reject(httpError(400, 'the upload was interrupted')));
+      out.on('error', reject);
+    });
+  } catch (e) {
+    fs.rmSync(part, { force: true });
+    throw e;
+  }
+  if (!size) { fs.rmSync(part, { force: true }); throw httpError(400, 'the file is empty (send it as the request body, for example curl -T file)'); }
+  fs.renameSync(part, path.join(FILES, id));
+  const f = { name, size, sha256: hash.digest('hex'), type: String(req.headers['content-type'] ?? '').split(';')[0].slice(0, 100) || 'application/octet-stream', from: me.name, to, note, created: new Date().toISOString(), downloads: 0 };
+  db.files[id] = f;
+  save();
+  const pf = publicFile(id, f);
+  const message = post(me.name, { to, kind: 'file', reply_to: reply ? Number(reply) : undefined, file: { id, name, size, sha256: f.sha256 }, body: `📎 ${name} (${humanSize(size)})${note ? `: ${note}` : ''}\nDownload: GET /api/files/${id}  ·  SHA-256 ${f.sha256}` });
+  return { ...pf, message: message.id };
+});
+route('GET', '/api/files', ({ me, url }) => {
+  const conversation = url.searchParams.get('conversation');
+  const list = Object.entries(db.files)
+    .filter(([, f]) => fileVisible(me.name, f) && (!conversation || conversationOf({ from: f.from, to: f.to }) === conversation))
+    .map(([id, f]) => publicFile(id, f))
+    .sort((a, b) => b.created.localeCompare(a.created));
+  return { files: list, ...(me.admin ? { used: filesTotal(), quota: FILES_QUOTA, maxFile: MAX_FILE } : { maxFile: MAX_FILE }) };
+});
+route('GET', '/api/files/([0-9a-f]{18})/info', ({ me, params }) => {
+  const f = db.files[params[0]];
+  if (!f || !fileVisible(me.name, f)) throw httpError(404, 'no such file');
+  return publicFile(params[0], f);
+});
+// a short-lived, single-use link for browsers (the dashboard's download buttons), so no token ends up in a URL
+route('POST', '/api/files/([0-9a-f]{18})/ticket', ({ me, params }) => {
+  const f = db.files[params[0]];
+  if (!f || !fileVisible(me.name, f)) throw httpError(404, 'no such file');
+  const ticket = crypto.randomBytes(18).toString('base64url');
+  downloadTickets.set(ticket, { id: params[0], expires: Date.now() + 60_000 });
+  return { url: `/files/${params[0]}?ticket=${ticket}` };
+});
+function sendFile(req, res, id, f) {
+  const file = path.join(FILES, id);
+  const total = f.size;
+  const headers = {
+    'content-type': 'application/octet-stream', // never rendered by the browser, whatever the uploader claimed
+    'content-disposition': `attachment; filename="${f.name.replace(/[^\x20-\x7e]/g, '_')}"; filename*=UTF-8''${encodeURIComponent(f.name)}`,
+    'x-content-type-options': 'nosniff',
+    'content-security-policy': "default-src 'none'",
+    'accept-ranges': 'bytes',
+    'x-sha256': f.sha256,
+  };
+  const range = /^bytes=(\d*)-(\d*)$/.exec(String(req.headers.range ?? ''));
+  if (range && (range[1] || range[2])) {
+    let start = range[1] ? Number(range[1]) : Math.max(0, total - Number(range[2]));
+    let end = range[1] && range[2] ? Math.min(Number(range[2]), total - 1) : total - 1;
+    if (start >= total || start > end) {
+      res.writeHead(416, { ...headers, 'content-range': `bytes */${total}` });
+      return res.end();
+    }
+    res.writeHead(206, { ...headers, 'content-length': end - start + 1, 'content-range': `bytes ${start}-${end}/${total}` });
+    return fs.createReadStream(file, { start, end }).pipe(res);
+  }
+  f.downloads = (f.downloads ?? 0) + 1;
+  save();
+  res.writeHead(200, { ...headers, 'content-length': total });
+  fs.createReadStream(file).pipe(res);
+}
+route('GET', '/api/files/([0-9a-f]{18})', ({ me, req, res, params }) => {
+  const f = db.files[params[0]];
+  if (!f || !fileVisible(me.name, f)) throw httpError(404, 'no such file');
+  sendFile(req, res, params[0], f);
+  return undefined;
+});
+route('DELETE', '/api/files/([0-9a-f]{18})', ({ me, params }) => {
+  const f = db.files[params[0]];
+  if (!f || !fileVisible(me.name, f)) throw httpError(404, 'no such file');
+  if (!me.admin && f.from !== me.name) throw httpError(403, 'only the sender or the admin can delete a file');
+  fs.rmSync(path.join(FILES, params[0]), { force: true });
+  delete db.files[params[0]];
+  save();
+  return { ok: true };
+});
+
 // ---------- where agents can reach the hub ----------
 /** Every address the hub answers on, best first: public links, then this network and Tailscale, then this computer. */
 function hubAddresses() {
@@ -1314,6 +1448,15 @@ const handler = async (req, res) => {
       res.writeHead(200, { 'content-type': meta.type, 'cache-control': 'public, max-age=86400', 'x-content-type-options': 'nosniff', 'content-security-policy': "default-src 'none'" });
       return fs.createReadStream(shared ? path.join(IMAGES, `${shared[1]}.${meta.ext}`) : path.join(CATALOG, `${listed[1]}.${meta.ext}`)).pipe(res);
     }
+    // File downloads from the dashboard: a one-time ticket stands in for the token
+    const ticketed = req.method === 'GET' && url.pathname.match(/^\/files\/([0-9a-f]{18})$/);
+    if (ticketed) {
+      const t = downloadTickets.get(url.searchParams.get('ticket') ?? '');
+      downloadTickets.delete(url.searchParams.get('ticket') ?? '');
+      const f = db.files[ticketed[1]];
+      if (!t || t.expires < Date.now() || t.id !== ticketed[1] || !f) throw httpError(403, 'this download link has expired: use the Download button again');
+      return sendFile(req, res, ticketed[1], f);
+    }
     // Agents' pictures are public, like the dashboard's own images
     const pic = req.method === 'GET' && url.pathname.match(/^\/avatars\/([a-z0-9_-]+)$/);
     if (pic) {
@@ -1342,6 +1485,10 @@ const handler = async (req, res) => {
 };
 const server = SCHEME === 'https' ? https.createServer({ cert: fs.readFileSync(TLS_CERT), key: fs.readFileSync(TLS_KEY) }, handler) : http.createServer(handler);
 
+// big files take longer than Node's default 5-minute request limit; idle connections still time out
+server.requestTimeout = 0;
+server.headersTimeout = 60_000;
+server.timeout = 0;
 server.on('error', (e) => {
   if (e.code !== 'EADDRINUSE') throw e;
   console.error(`Port ${PORT} is already in use. Is another hub running? Choose another port with --port.`);

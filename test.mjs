@@ -467,6 +467,51 @@ try {
     } else console.log('  (HTTPS part skipped: openssl not found)');
     fs.rmSync(tls, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
+  await check('files: send to an agent or a chat, only that conversation can download, checksums, resume, size limit', async () => {
+    const crypto = await import('node:crypto');
+    const up = (token, query, body, headers = {}) => fetch(`${base}/api/files?${query}`, { method: 'PUT', headers: { authorization: `Bearer ${token}`, ...headers }, body }).then(async (r) => ({ status: r.status, data: await r.json() }));
+    const fa = (await call(ADMIN, 'POST', '/api/agents', { name: 'filer', kind: 'http' })).data.token;
+    const fb = (await call(ADMIN, 'POST', '/api/agents', { name: 'fetcher', kind: 'http' })).data.token;
+    const fc = (await call(ADMIN, 'POST', '/api/agents', { name: 'outsider', kind: 'http' })).data.token;
+    const content = crypto.randomBytes(300_000); // binary, bigger than a message could carry
+    const sent = await up(fa, 'to=fetcher&name=../../shard_00000.bin&note=proof%20corpus', content);
+    assert.equal(sent.status, 200);
+    assert.equal(sent.data.name, 'shard_00000.bin', 'paths are stripped from file names');
+    assert.equal(sent.data.size, content.length);
+    assert.equal(sent.data.sha256, crypto.createHash('sha256').update(content).digest('hex'));
+    // it arrives as a message with the file attached
+    const msg = (await call(fb, 'GET', `/api/messages?since=${sent.data.message - 1}`)).data.messages.find((m) => m.id === sent.data.message);
+    assert.equal(msg.kind, 'file');
+    assert.equal(msg.file.id, sent.data.id);
+    // the recipient downloads it exactly; others don't see it at all
+    const got = await fetch(`${base}/api/files/${sent.data.id}`, { headers: { authorization: `Bearer ${fb}` } });
+    assert.equal(got.headers.get('content-type'), 'application/octet-stream');
+    assert.match(got.headers.get('content-disposition'), /attachment/);
+    assert(Buffer.from(await got.arrayBuffer()).equals(content));
+    assert.equal((await call(fc, 'GET', `/api/files/${sent.data.id}/info`)).status, 404);
+    assert.equal((await call(fc, 'GET', '/api/files')).data.files.some((f) => f.id === sent.data.id), false);
+    assert.equal((await call(fb, 'GET', '/api/files')).data.files.some((f) => f.id === sent.data.id), true);
+    // resume: a byte range
+    const part = await fetch(`${base}/api/files/${sent.data.id}`, { headers: { authorization: `Bearer ${fb}`, range: 'bytes=1000-1999' } });
+    assert.equal(part.status, 206);
+    assert(Buffer.from(await part.arrayBuffer()).equals(content.subarray(1000, 2000)));
+    // the dashboard's download links: one-time tickets instead of a token in the URL
+    const ticket = (await call(ADMIN, 'POST', `/api/files/${sent.data.id}/ticket`)).data.url;
+    assert.equal((await fetch(base + ticket)).status, 200);
+    assert.equal((await fetch(base + ticket)).status, 403, 'a ticket works once');
+    // to a channel: its members
+    await call(fa, 'POST', '/api/channels/datasets/join'); await call(fb, 'POST', '/api/channels/datasets/join');
+    const ch = await up(fa, 'to=%23datasets&name=notes.txt', 'hello');
+    assert.equal(ch.status, 200);
+    assert.equal((await fetch(`${base}/api/files/${ch.data.id}`, { headers: { authorization: `Bearer ${fb}` } })).status, 200);
+    assert.equal((await fetch(`${base}/api/files/${ch.data.id}`, { headers: { authorization: `Bearer ${fc}` } })).status, 404);
+    // refusals: no recipient, empty, someone else deleting; the sender can delete
+    assert.equal((await up(fa, 'name=x.bin', 'abc')).status, 400);
+    assert.equal((await up(fa, 'to=fetcher&name=empty.bin', '')).status, 400);
+    assert.equal((await call(fb, 'DELETE', `/api/files/${sent.data.id}`)).status, 403);
+    assert.equal((await call(fa, 'DELETE', `/api/files/${sent.data.id}`)).status, 200);
+    assert.equal((await fetch(`${base}/api/files/${sent.data.id}`, { headers: { authorization: `Bearer ${fb}` } })).status, 404);
+  });
   await check('presence: an agent waiting for messages counts as connected and online', async () => {
     const waiting = call(hades, 'GET', '/api/messages?since=999999&wait=3');
     await new Promise((r) => setTimeout(r, 300));
@@ -508,7 +553,7 @@ try {
     assert.equal(init.result.serverInfo.name, 'agent-hub');
     bridge.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
     const tools = (await rpc('tools/list')).result.tools.map((t) => t.name);
-    assert.deepEqual(tools, ['hub_whoami', 'hub_list_agents', 'hub_send', 'hub_read', 'hub_set_avatar', 'hub_share_image', 'hub_join_channel', 'hub_leave_channel']);
+    assert.deepEqual(tools, ['hub_whoami', 'hub_list_agents', 'hub_send', 'hub_read', 'hub_set_avatar', 'hub_share_image', 'hub_send_file', 'hub_list_files', 'hub_download_file', 'hub_join_channel', 'hub_leave_channel']);
     const sent = await rpc('tools/call', { name: 'hub_send', arguments: { to: 'hades', body: 'sent through MCP' } });
     assert.match(sent.result.content[0].text, /Sent message #\d+ to hades/);
     const read = await rpc('tools/call', { name: 'hub_read', arguments: {} });
@@ -516,6 +561,18 @@ try {
     assert.match(read.result.content[0].text, /Hi Hades/);
     const again = await rpc('tools/call', { name: 'hub_read', arguments: {} });
     assert.equal(again.result.content[0].text, 'No new messages.');
+    // files through MCP: send one, find it, download it back with its checksum verified
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-hub-test-mcp-'));
+    const original = path.join(tmp, 'dataset.bin');
+    fs.writeFileSync(original, Buffer.alloc(200_000, 7));
+    const shared = await rpc('tools/call', { name: 'hub_send_file', arguments: { file_path: original, to: 'hades', note: 'test data' } });
+    assert.match(shared.result.content[0].text, /Sent dataset\.bin \(200000 bytes\) to hades/);
+    const fileId = shared.result.content[0].text.match(/File id ([0-9a-f]{18})/)[1];
+    assert.match((await rpc('tools/call', { name: 'hub_list_files', arguments: {} })).result.content[0].text, new RegExp(fileId));
+    const saved = await rpc('tools/call', { name: 'hub_download_file', arguments: { id: fileId, folder: path.join(tmp, 'in') } });
+    assert.match(saved.result.content[0].text, /SHA-256 verified/);
+    assert(fs.readFileSync(path.join(tmp, 'in', 'dataset.bin')).equals(fs.readFileSync(original)));
+    fs.rmSync(tmp, { recursive: true, force: true });
     const bad = await rpc('tools/call', { name: 'hub_send', arguments: { to: 'nobody', body: 'x' } });
     assert.equal(bad.result.isError, true);
     bridge.kill();

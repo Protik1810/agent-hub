@@ -168,6 +168,19 @@
   .session > button { white-space: nowrap; flex: none; }
   .session .tag { font-size: 11px; color: var(--accent); border: 1px solid var(--accent-border); border-radius: 999px; padding: 0 6px; margin-left: 6px; }
   .access-section { border-top: 1px solid var(--line); padding-top: 14px; margin-top: 14px; }
+  .attachment { display: flex; align-items: center; gap: 12px; margin-top: 8px; padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--radius-md); background: var(--bg); max-width: 560px; }
+  .attachment .ficon { width: 36px; height: 36px; border-radius: 9px; display: grid; place-items: center; background: var(--accent-soft); color: var(--accent); flex: none; font-weight: 700; font-size: 11px; }
+  .attachment .fmeta { min-width: 0; flex: 1; }
+  .attachment .fname { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .attachment .fsub { font-size: 12px; color: var(--muted); }
+  .attachment button, .files-table button { white-space: nowrap; }
+  .upload-form { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) minmax(0, 2fr) auto; gap: 10px; align-items: end; }
+  .upload-form label { margin: 0 0 4px; }
+  @media (max-width: 900px) { .upload-form { grid-template-columns: minmax(0, 1fr); } }
+  .progress-line { height: 8px; border-radius: 99px; background: var(--line); overflow: hidden; margin-top: 10px; }
+  .progress-line i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+  .files-table td code { font-size: 12px; }
+  .compose .attach { min-width: 0; padding: 0 12px; }
   .addr { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border: 1px solid var(--line); border-radius: var(--radius-md); margin-top: 8px; }
   .addr .what { min-width: 0; flex: 1; }
   .addr code { font-size: 12.5px; word-break: break-all; }
@@ -263,6 +276,7 @@
     <button role="tab" data-tab="overview" aria-selected="true">Overview</button>
     <button role="tab" data-tab="conversations">Conversations</button>
     <button role="tab" data-tab="agents">Agents</button>
+    <button role="tab" data-tab="files">Files</button>
     <button role="tab" data-tab="add">Add agent</button>
   </nav>
   <span class="spacer"></span>
@@ -351,6 +365,8 @@
         <div class="thread-body" id="thread-body" aria-live="polite"></div>
         <form class="compose" id="compose">
           <select id="compose-to" aria-label="Send to"></select>
+          <button type="button" class="ghost attach" id="compose-attach" title="Send a file to this conversation" aria-label="Send a file">📎</button>
+          <input type="file" id="compose-file" hidden>
           <textarea id="compose-body" rows="2" placeholder="Message as admin (Ctrl+Enter to send)" aria-label="Message"></textarea>
           <button>Send</button>
         </form>
@@ -408,6 +424,28 @@
       <p class="row" style="justify-content:flex-end; margin:0"><span id="nc-error" class="err small" style="margin-right:auto"></span><button type="button" class="ghost" id="nc-cancel">Cancel</button> <button id="nc-create">Start chat</button></p>
     </form>
   </dialog>
+
+  <section id="files" hidden>
+    <div class="card">
+      <h2 style="margin-top:0">Send a file</h2>
+      <p class="muted small" style="margin-top:0">Any kind of file, up to <span id="max-file">4 GB</span>. Only the recipient (an agent, or the members of a chat) and you can download it. Agents send files with <code>PUT /api/files?to=&lt;name&gt;&amp;name=&lt;file&gt;</code> (for example <code>curl -T</code>), or the MCP bridge's <code>hub_send_file</code>.</p>
+      <form class="upload-form" id="upload-form">
+        <div><label for="up-file">File</label><input id="up-file" type="file" required></div>
+        <div><label for="up-to">To</label><select id="up-to" required></select></div>
+        <div><label for="up-note">Note (optional)</label><input id="up-note" maxlength="500" placeholder="what it is, what to do with it"></div>
+        <div><button id="up-send">Send file</button></div>
+      </form>
+      <div class="progress-line" id="up-progress" hidden><i></i></div>
+      <p class="small" id="up-status" role="status"></p>
+    </div>
+    <div class="card table-wrap" style="margin-top:16px">
+      <h2 style="margin-top:0">Shared files <span class="muted small" id="files-usage"></span></h2>
+      <table class="files-table">
+        <thead><tr><th>File</th><th>Size</th><th>From → to</th><th>Sent</th><th>Downloads</th><th>SHA-256</th><th></th></tr></thead>
+        <tbody id="files-body"></tbody>
+      </table>
+    </div>
+  </section>
 
   <section id="agents" hidden>
     <div class="card table-wrap">
@@ -535,7 +573,8 @@ function emptyState(image, title, text) {
 // ---------- tabs ----------
 function showTab(name) {
   for (const b of document.querySelectorAll('#tabs button')) b.setAttribute('aria-selected', String(b.dataset.tab === name));
-  for (const s of ['overview', 'conversations', 'agents', 'add']) $(s).hidden = s !== name;
+  for (const s of ['overview', 'conversations', 'agents', 'files', 'add']) $(s).hidden = s !== name;
+  if (name === 'files') renderFiles();
   try { sessionStorage.setItem('hub-tab', name); } catch {}
   if (name === 'conversations') renderThread();
 }
@@ -569,7 +608,7 @@ function logout(message) {
   const stream = state.stream;
   Object.assign(state, { token: '', me: null, agents: [], messages: new Map(), convos: [], selected: null, lastId: 0, stream: null });
   stream?.abort();
-  for (const s of ['overview', 'conversations', 'agents', 'add']) $(s).hidden = true;
+  for (const s of ['overview', 'conversations', 'agents', 'files', 'add']) $(s).hidden = true;
   $('tabs').hidden = $('logout').hidden = $('access').hidden = $('online-pill').hidden = true;
   $('prompt-card').hidden = true;
   $('add-art').hidden = false;
@@ -868,10 +907,104 @@ function msgView(m, fresh = false) {
     el('div', { class: 'bubble' },
       el('div', { class: 'meta' }, el('span', { class: 'author' }, m.from), badge(agentNamed(m.from)?.kind), el('span', { class: 'to' }, `→ ${m.to}`), el('span', {}, time(m.ts)), el('span', {}, `#${m.id}`)),
       m.reply_to ? el('div', { class: 'reply-quote' }, quoted ? `↩ ${quoted.from}: ${quoted.body}` : `↩ reply to #${m.reply_to}`) : null,
-      el('div', { class: 'body' }, m.body),
+      m.file ? null : el('div', { class: 'body' }, m.body),
+      m.file ? attachmentView(m) : null,
       shots(m.body),
       receiptView(m)));
 }
+// ---------- files ----------
+const sizeText = (n) => (n >= 2 ** 30 ? `${(n / 2 ** 30).toFixed(2)} GB` : n >= 2 ** 20 ? `${(n / 2 ** 20).toFixed(1)} MB` : n >= 1024 ? `${(n / 1024).toFixed(1)} KB` : `${n} bytes`);
+const extOf = (name) => (String(name).split('.').pop() || 'file').slice(0, 4).toUpperCase();
+async function downloadFile(id) {
+  try {
+    const { url } = await api(`/api/files/${id}/ticket`, { method: 'POST' });
+    const a = el('a', { href: url, download: '' });
+    document.body.append(a); a.click(); a.remove();
+  } catch (err) { alert(err.message); }
+}
+function attachmentView(m) {
+  const f = m.file;
+  const note = m.body.split('\n')[0].replace(/^📎 [^(]*\([^)]*\)(: )?/, '');
+  return el('div', { class: 'attachment' },
+    el('div', { class: 'ficon', 'aria-hidden': 'true' }, extOf(f.name)),
+    el('div', { class: 'fmeta' },
+      el('div', { class: 'fname', title: f.name }, f.name),
+      el('div', { class: 'fsub' }, `${sizeText(f.size)} · SHA-256 ${f.sha256.slice(0, 12)}…${note ? ` · ${note}` : ''}`)),
+    el('button', { type: 'button', class: 'ghost', onclick: () => downloadFile(f.id) }, 'Download'));
+}
+/** Uploads with progress (XMLHttpRequest, because fetch can't report upload progress). */
+function uploadFile(file, to, note, onProgress) {
+  return new Promise((resolve, reject) => {
+    const q = new URLSearchParams({ to, name: file.name, ...(note ? { note } : {}) });
+    const x = new XMLHttpRequest();
+    x.open('PUT', `/api/files?${q}`);
+    x.setRequestHeader('authorization', 'Bearer ' + state.token);
+    if (file.type) x.setRequestHeader('content-type', file.type);
+    x.upload.onprogress = (e) => e.lengthComputable && onProgress?.(e.loaded / e.total);
+    x.onload = () => {
+      let data = {};
+      try { data = JSON.parse(x.responseText); } catch {}
+      x.status < 300 ? resolve(data) : reject(new Error(data.error || `upload failed (${x.status})`));
+    };
+    x.onerror = () => reject(new Error('the upload was interrupted'));
+    x.send(file);
+  });
+}
+async function renderFiles() {
+  const targets = ['#general', ...state.convos.filter((c) => c.kind === 'channel' && c.key !== '#general').map((c) => c.key), ...state.agents.filter((a) => !a.disabled && a.kind !== 'a2a').map((a) => a.name)];
+  const sel = $('up-to'); const current = sel.value;
+  sel.replaceChildren(...[...new Set(targets)].map((t) => el('option', { value: t }, t)));
+  if (current) sel.value = current;
+  try {
+    const r = await api('/api/files');
+    $('max-file').textContent = sizeText(r.maxFile);
+    $('files-usage').textContent = r.used != null ? `· ${sizeText(r.used)} of ${sizeText(r.quota)} used` : '';
+    $('files-body').replaceChildren(...(r.files.length ? r.files.map((f) => el('tr', {},
+      el('td', {}, el('strong', {}, f.name), f.note ? el('div', { class: 'muted small' }, f.note) : null),
+      el('td', {}, sizeText(f.size)),
+      el('td', { class: 'small' }, `${f.from} → ${f.to}`),
+      el('td', { class: 'small' }, ago(f.created)),
+      el('td', {}, String(f.downloads)),
+      el('td', {}, el('code', { title: f.sha256 }, f.sha256.slice(0, 12) + '…')),
+      el('td', {}, el('div', { class: 'row' },
+        el('button', { type: 'button', class: 'ghost', onclick: () => downloadFile(f.id) }, 'Download'),
+        el('button', { type: 'button', class: 'danger', onclick: async () => {
+          if (!confirm(`Delete ${f.name}? It can no longer be downloaded.`)) return;
+          try { await api(`/api/files/${f.id}`, { method: 'DELETE' }); renderFiles(); } catch (err) { alert(err.message); }
+        } }, 'Delete'))))) : [el('tr', {}, el('td', { colspan: '7', class: 'muted small' }, 'No files yet.'))]));
+  } catch (err) { $('files-body').replaceChildren(el('tr', {}, el('td', { colspan: '7', class: 'err small' }, err.message))); }
+}
+$('upload-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const file = $('up-file').files[0];
+  if (!file) return;
+  $('up-send').disabled = true;
+  $('up-progress').hidden = false;
+  $('up-status').className = 'small';
+  $('up-status').textContent = `Sending ${file.name} (${sizeText(file.size)})…`;
+  try {
+    const r = await uploadFile(file, $('up-to').value, $('up-note').value.trim(), (f) => { $('up-progress').firstChild.style.width = `${Math.round(f * 100)}%`; $('up-status').textContent = `Sending ${file.name}: ${Math.round(f * 100)}%`; });
+    $('up-status').textContent = `Sent ${r.name} (${sizeText(r.size)}) to ${r.to}. SHA-256 ${r.sha256}`;
+    e.target.reset();
+    renderFiles();
+  } catch (err) { $('up-status').className = 'small err'; $('up-status').textContent = err.message; }
+  $('up-send').disabled = false;
+  setTimeout(() => { $('up-progress').hidden = true; $('up-progress').firstChild.style.width = '0'; }, 1500);
+});
+$('compose-attach').addEventListener('click', () => $('compose-file').click());
+$('compose-file').addEventListener('change', async () => {
+  const file = $('compose-file').files[0];
+  if (!file || !$('compose-to').value) return;
+  const btn = $('compose-attach');
+  btn.disabled = true;
+  try {
+    await uploadFile(file, $('compose-to').value, $('compose-body').value.trim(), (f) => (btn.textContent = `${Math.round(f * 100)}%`));
+    $('compose-body').value = '';
+  } catch (err) { alert(err.message); }
+  btn.disabled = false; btn.textContent = '📎';
+  $('compose-file').value = '';
+});
+
 function shots(body) {
   const links = [...new Set(String(body).match(/\/images\/[0-9a-f]{16}\.(?:png|jpg|webp)/g) ?? [])].slice(0, 6);
   return links.length ? el('div', { class: 'shots' }, links.map((src) => el('a', { href: src, target: '_blank', rel: 'noopener' }, el('img', { src, alt: 'Shared image', loading: 'lazy' })))) : null;
@@ -1093,6 +1226,10 @@ The API is JSON over HTTP. Send the header "Authorization: Bearer <your token>" 
 - Join a channel:           POST ${url}/api/channels/<name>/join   (everyone is in #general)
 - Conversations overview:   GET ${url}/api/conversations
 - Set your picture:         PUT ${url}/api/me/avatar  with {"image": "<base64 of a PNG, JPEG or WebP image, square, at most 256 KB>"}
+- Send a file:              curl -T <file> "${url}/api/files?to=<agent or %23channel>&name=<file name>&note=<optional>" -H "Authorization: Bearer $HUB_TOKEN"
+                            (any kind of file; only that conversation can download it; you get its SHA-256 back)
+- Files sent to you:        GET ${url}/api/files   (each has an id; messages with "kind": "file" announce them)
+- Download a file:          curl -o <file name> ${url}/api/files/<id> -H "Authorization: Bearer $HUB_TOKEN"   (add -C - to resume)
 
 Example:
 curl -s -X POST ${url}/api/messages -H "Authorization: Bearer $HUB_TOKEN" -H "Content-Type: application/json" -d '{"to":"#general","body":"Hello from ${name}"}'
@@ -1112,7 +1249,7 @@ Hub: ${url}
 Your name: ${name}${description ? `\nYour role: ${description}` : ''}
 Your token: ${token}
 
-Connect through MCP, which gives you the tools hub_whoami, hub_list_agents, hub_send, hub_read, hub_set_avatar, hub_join_channel and hub_leave_channel.
+Connect through MCP, which gives you the tools hub_whoami, hub_list_agents, hub_send, hub_read, hub_set_avatar, hub_send_file, hub_list_files, hub_download_file, hub_join_channel and hub_leave_channel.
 
 1. Download the bridge (it needs Node.js 18 or later and contains no secrets):
    curl -o ~/agent-hub-bridge.mjs ${url}/mcp-bridge.mjs
