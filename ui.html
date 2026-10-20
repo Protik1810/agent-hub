@@ -168,6 +168,13 @@
   .session > button { white-space: nowrap; flex: none; }
   .session .tag { font-size: 11px; color: var(--accent); border: 1px solid var(--accent-border); border-radius: 999px; padding: 0 6px; margin-left: 6px; }
   .access-section { border-top: 1px solid var(--line); padding-top: 14px; margin-top: 14px; }
+  .addr { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border: 1px solid var(--line); border-radius: var(--radius-md); margin-top: 8px; }
+  .addr .what { min-width: 0; flex: 1; }
+  .addr code { font-size: 12.5px; word-break: break-all; }
+  .addr .kind { font-size: 11px; font-weight: 600; padding: 1px 8px; border-radius: 999px; background: var(--line-subtle); color: var(--muted); white-space: nowrap; }
+  .addr .kind.public { background: var(--accent-soft); color: var(--accent); }
+  .addr .kind.network, .addr .kind.tailscale { background: var(--ok-soft); color: var(--ok); }
+  .addr button { white-space: nowrap; flex: none; }
   .auth-form label { margin-top: 10px; }
   .auth-form input { width: 100%; }
   .auth-switch { background: none; border: 0; padding: 0; color: var(--accent); font-weight: 500; font-size: 13px; cursor: pointer; min-height: 0; }
@@ -366,6 +373,12 @@
       </details>
     </div>
     <div class="access-section">
+      <strong>Where agents can reach this hub</strong>
+      <div class="muted small">Give agents on other machines one of these addresses (Add agent uses it in their prompt).</div>
+      <div id="addr-warning" class="notice small" hidden></div>
+      <div id="addresses"></div>
+    </div>
+    <div class="access-section">
       <strong>Sign in on another device</strong>
       <div class="muted small">Get a one-time code, open this hub's address on the other device, choose <em>Use a token or sign-in code</em>, and type the code. It works once, within 5 minutes.</div>
       <div id="signin-code-box" hidden><div class="signin-code" id="signin-code"></div><div class="muted small" id="signin-code-note"></div></div>
@@ -447,8 +460,10 @@
           </div>
           <div id="hub-url-fields">
           <label for="a-url">Hub address the agent should use</label>
-          <input id="a-url">
-          <div id="url-warning" class="notice small" hidden>This address only works on this computer. For agents on other machines, open the dashboard through the hub's network address (for example <code>http://192.168.1.10:7700</code>) or set <code>HUB_PUBLIC_URL</code>.</div>
+          <input id="a-url" list="a-url-options">
+          <datalist id="a-url-options"></datalist>
+          <div class="muted small" id="a-url-hint" style="margin-top:4px"></div>
+          <div id="url-warning" class="notice small" hidden>This address only works for agents on this computer. For agents on other machines, choose a network, Tailscale or public address from the list.</div>
           </div>
           <p><button id="add-submit">Create agent and prompt</button> <span id="add-error" class="err"></span></p>
         </form>
@@ -536,6 +551,7 @@ async function login(token) {
   $('login').hidden = true;
   $('tabs').hidden = $('logout').hidden = $('access').hidden = $('online-pill').hidden = false;
   renderToken();
+  loadAddresses();
   await refresh();
   const { messages } = await api('/api/messages?since=0&limit=500');
   for (const m of messages) addMessage(m, false);
@@ -624,6 +640,7 @@ $('logout').addEventListener('click', async () => {
 async function openAccess() {
   $('signin-code-box').hidden = true;
   $('pw-result').textContent = '';
+  loadAddresses();
   try {
     const a = await api('/api/account');
     $('account-line').textContent = a.username ? `Signed in as ${a.username}${a.lastLogin ? ` · last sign-in ${ago(a.lastLogin)}` : ''}.` : 'This hub uses a fixed admin token (HUB_ADMIN_TOKEN) and has no account.';
@@ -1191,7 +1208,37 @@ if __name__ == "__main__":
 };
 
 function hubUrl() {
-  return (state.config?.publicUrl || location.origin).replace(/\/$/, '');
+  return (state.config?.publicUrl || state.bestAddress || location.origin).replace(/\/$/, '');
+}
+// ---------- where agents can reach the hub ----------
+const ADDRESS_KINDS = { public: 'internet', tailscale: 'Tailscale', network: 'local network', virtual: 'virtual network', local: 'this computer' };
+async function loadAddresses() {
+  try {
+    const a = await api('/api/addresses');
+    state.addresses = a;
+    // the dashboard's own address is best when it was opened from elsewhere; otherwise the hub's best reachable one
+    const here = ['localhost', '127.0.0.1', '[::1]'].includes(location.hostname) ? null : location.origin;
+    state.bestAddress = here ?? a.addresses[0]?.url ?? location.origin;
+    $('a-url-options').replaceChildren(...a.addresses.map((x) => el('option', { value: x.url }, `${x.label}`)));
+    const field = $('a-url');
+    if (!field.dataset.touched) { field.value = hubUrl(); checkUrl(); }
+    document.querySelectorAll('.hub-addr').forEach((c) => (c.textContent = hubUrl()));
+    $('token-curl').textContent = `curl -H "Authorization: Bearer YOUR_TOKEN" ${hubUrl()}/api/agents`;
+    $('a-url-hint').textContent = a.sharedOnNetwork ? `${a.addresses.length - 1} address${a.addresses.length === 2 ? '' : 'es'} for other machines: pick one from the list.` : 'The hub only listens on this computer: agents elsewhere cannot connect yet.';
+    renderAddresses();
+  } catch {}
+}
+function renderAddresses() {
+  const a = state.addresses;
+  if (!a) return;
+  $('addr-warning').hidden = a.sharedOnNetwork;
+  $('addr-warning').textContent = 'The hub only listens on this computer, so agents on other machines cannot connect. In the Agent Hub app, turn on "Share on the network" in the tray menu (or start the server with --host 0.0.0.0).';
+  $('addresses').replaceChildren(...a.addresses.map((x) => el('div', { class: 'addr' },
+    el('div', { class: 'what' }, el('div', { class: 'small' }, x.label), el('code', {}, x.url)),
+    el('span', { class: `kind ${x.kind}` }, ADDRESS_KINDS[x.kind] ?? x.kind),
+    el('button', { type: 'button', class: 'ghost', onclick: async (e) => {
+      try { await navigator.clipboard.writeText(x.url); e.target.textContent = 'Copied'; setTimeout(() => (e.target.textContent = 'Copy'), 1500); } catch {}
+    } }, 'Copy'))));
 }
 function renderKinds() {
   $('kinds').replaceChildren(...Object.entries(KINDS).map(([key, k], i) => el('label', { class: 'choice' },
@@ -1212,7 +1259,7 @@ function checkUrl() {
   try { local = ['localhost', '127.0.0.1', '[::1]'].includes(new URL($('a-url').value).hostname); } catch {}
   $('url-warning').hidden = !local;
 }
-$('a-url').addEventListener('input', checkUrl);
+$('a-url').addEventListener('input', () => { $('a-url').dataset.touched = '1'; checkUrl(); });
 function showPrompt(name, token, kind, description) {
   const url = ($('a-url').value || hubUrl()).replace(/\/$/, '');
   $('p-name').textContent = name;

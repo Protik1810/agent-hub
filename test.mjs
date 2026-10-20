@@ -411,6 +411,62 @@ try {
       fs.rmSync(data2, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   });
+  await check('network: tunnels are not "this computer", addresses are listed, HTTPS with a certificate', async () => {
+    const data3 = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-hub-test-net-'));
+    const port3 = port + 2;
+    const env = { ...process.env, HUB_HOST: '0.0.0.0', HUB_PORT: String(port3), HUB_DATA: data3, HUB_EXTRA_URLS: 'Public link=https://hub.example.net' };
+    delete env.HUB_ADMIN_TOKEN;
+    const hub3 = spawn(process.execPath, [path.join(here, 'server.mjs')], { env, stdio: ['ignore', 'pipe', 'inherit'] });
+    await new Promise((resolve) => hub3.stdout.on('data', (d) => d.toString().includes('listening') && resolve()));
+    const get = (p, headers = {}) => fetch(`http://127.0.0.1:${port3}${p}`, { headers }).then((r) => r.json());
+    try {
+      // a browser here may create the account; the same request relayed by a tunnel may not
+      assert.equal((await get('/api/setup')).canSignUpHere, true);
+      for (const headers of [{ 'x-forwarded-for': '203.0.113.9' }, { 'cf-connecting-ip': '203.0.113.9' }, { 'tailscale-user-login': 'someone@example.com' }]) {
+        assert.equal((await get('/api/setup', headers)).canSignUpHere, false, JSON.stringify(headers));
+      }
+      // a proxy that keeps the public host name (fetch can't set Host, so plain http)
+      const http = await import('node:http');
+      const viaHost = await new Promise((resolve, reject) => http.get({ host: '127.0.0.1', port: port3, path: '/api/setup', headers: { host: 'hub.example.net' } }, (res) => { let b = ''; res.on('data', (c) => (b += c)); res.on('end', () => resolve(JSON.parse(b))); }).on('error', reject));
+      assert.equal(viaHost.canSignUpHere, false, 'another host name is not this computer');
+      const relayed = await fetch(`http://127.0.0.1:${port3}/api/signup`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-forwarded-for': '203.0.113.9' }, body: JSON.stringify({ username: 'intruder', password: 'long enough password' }) });
+      assert.equal(relayed.status, 403, 'a relayed sign-up needs the setup code');
+      const up = await fetch(`http://127.0.0.1:${port3}/api/signup`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ username: 'owner', password: 'long enough password' }) }).then((r) => r.json());
+      // failed sign-ins through the tunnel are logged against the real sender
+      await fetch(`http://127.0.0.1:${port3}/api/login`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-forwarded-for': '203.0.113.9' }, body: JSON.stringify({ username: 'owner', password: 'wrong wrong wrong' }) });
+      const tries = await get('/api/sign-ins', { authorization: `Bearer ${up.token}` });
+      assert(tries.signIns.some((t) => !t.ok && t.address === '203.0.113.9'));
+      // the addresses agents can use: the public link first, this computer last
+      const addr = await get('/api/addresses', { authorization: `Bearer ${up.token}` });
+      assert.equal(addr.sharedOnNetwork, true);
+      assert.equal(addr.addresses[0].url, 'https://hub.example.net');
+      assert.equal(addr.addresses.at(-1).kind, 'local');
+      // agent cards use the address the caller came through (https behind a tunnel)
+      const cards = await get('/a2a', { 'x-forwarded-proto': 'https', 'x-forwarded-host': 'hub.example.net', 'x-forwarded-for': '203.0.113.9' });
+      assert(cards.agents.every((a) => a.card.startsWith('https://hub.example.net/')) || cards.agents.length === 0);
+    } finally {
+      await new Promise((r) => { hub3.once('exit', r); hub3.kill(); });
+      fs.rmSync(data3, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+    // HTTPS with a certificate (skipped where openssl isn't available)
+    const tls = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-hub-test-tls-'));
+    const { spawnSync } = await import('node:child_process');
+    const made = spawnSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1', '-subj', '/CN=localhost', '-keyout', path.join(tls, 'key.pem'), '-out', path.join(tls, 'cert.pem')], { stdio: 'ignore' });
+    if (made.status === 0) {
+      const port4 = port + 3;
+      const hub4 = spawn(process.execPath, [path.join(here, 'server.mjs'), '--port', String(port4), '--data', path.join(tls, 'data'), '--tls-cert', path.join(tls, 'cert.pem'), '--tls-key', path.join(tls, 'key.pem')], { env: { ...process.env, HUB_ADMIN_TOKEN: 'x' }, stdio: ['ignore', 'pipe', 'inherit'] });
+      const line = await new Promise((resolve) => hub4.stdout.on('data', (d) => d.toString().includes('listening') && resolve(d.toString())));
+      try {
+        assert.match(line, /https:\/\/127\.0\.0\.1/);
+        const https = await import('node:https');
+        const body = await new Promise((resolve, reject) => https.get(`https://127.0.0.1:${port4}/api/health`, { rejectUnauthorized: false }, (res) => { let b = ''; res.on('data', (c) => (b += c)); res.on('end', () => resolve(b)); }).on('error', reject));
+        assert.equal(JSON.parse(body).ok, true);
+      } finally {
+        await new Promise((r) => { hub4.once('exit', r); hub4.kill(); });
+      }
+    } else console.log('  (HTTPS part skipped: openssl not found)');
+    fs.rmSync(tls, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
   await check('presence: an agent waiting for messages counts as connected and online', async () => {
     const waiting = call(hades, 'GET', '/api/messages?since=999999&wait=3');
     await new Promise((r) => setTimeout(r, 300));

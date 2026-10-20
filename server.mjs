@@ -12,18 +12,21 @@
 // HUB_ADMIN_TOKEN (a fixed admin token, instead of the account's), HUB_PUBLIC_URL (the address agents should use,
 // shown in onboarding prompts), HUB_MAX_MESSAGES (5000 kept), HUB_RATE (messages per agent per minute, 60).
 // Options (they override the environment): --host, --port, --data, --history, --public-url, --open (open the
-// dashboard in the default browser).
+// dashboard in the default browser), --tls-cert / --tls-key (serve HTTPS with your own certificate; HUB_TLS_CERT,
+// HUB_TLS_KEY). HUB_EXTRA_URLS: more addresses the hub can be reached at (comma-separated, label=url), shown to the admin.
 //
 // The first time, open the dashboard on the hub's own computer and create the hub's account (or use the setup code
 // printed below when the hub has no account yet). The desktop app (desktop/) runs this same file in the background.
 import http from 'node:http';
+import https from 'node:https';
+import os from 'node:os';
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
-const VERSION = '1.9.0';
+const VERSION = '1.10.0';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
 const option = (name) => {
@@ -40,6 +43,9 @@ const DATA = path.resolve(option('data') ?? process.env.HUB_DATA ?? path.join(he
 const HISTORY = option('history') ?? process.env.HUB_HISTORY ?? null;
 const PUBLIC_URL = (option('public-url') ?? process.env.HUB_PUBLIC_URL ?? '').replace(/\/$/, '') || null;
 const OPEN = args.includes('--open');
+const TLS_CERT = option('tls-cert') ?? process.env.HUB_TLS_CERT ?? null;
+const TLS_KEY = option('tls-key') ?? process.env.HUB_TLS_KEY ?? null;
+const SCHEME = TLS_CERT && TLS_KEY ? 'https' : 'http';
 const MAX_MESSAGES = Number(process.env.HUB_MAX_MESSAGES ?? 5000);
 const RATE = Number(process.env.HUB_RATE ?? 60);
 const ONLINE_WINDOW = 2 * 60 * 1000; // active within the last two minutes counts as online
@@ -655,7 +661,25 @@ function newLoginCode() {
   loginCodes.set(code, { expires: Date.now() + 300_000 });
   return code;
 }
-const isLoopback = (req) => ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(req.socket.remoteAddress);
+// Requests that come through a tunnel or reverse proxy (Tailscale Serve/Funnel, Cloudflare, nginx...) reach the hub
+// from this computer too; they carry forwarding headers, and they are treated as coming from the internet.
+const LOOPBACK = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
+const PROXY_HEADERS = ['x-forwarded-for', 'forwarded', 'x-real-ip', 'cf-connecting-ip', 'true-client-ip', 'tailscale-user-login', 'x-forwarded-host'];
+const proxied = (req) => LOOPBACK.has(req.socket.remoteAddress) && PROXY_HEADERS.some((h) => req.headers[h] !== undefined);
+/** Is this request from a browser on the hub's own computer (not relayed by a tunnel or proxy)? */
+const isLoopback = (req) => {
+  if (!LOOPBACK.has(req.socket.remoteAddress) || proxied(req)) return false;
+  const host = String(req.headers.host ?? '').replace(/:\d+$/, '').toLowerCase();
+  return ['localhost', '127.0.0.1', '[::1]', ''].includes(host);
+};
+/** The address a request really comes from: the forwarded one when a local proxy relayed it. */
+function clientAddress(req) {
+  if (proxied(req)) {
+    const forwarded = String(req.headers['cf-connecting-ip'] ?? req.headers['true-client-ip'] ?? req.headers['x-real-ip'] ?? req.headers['x-forwarded-for'] ?? '').split(',')[0].trim();
+    if (forwarded) return forwarded;
+  }
+  return String(req.socket.remoteAddress ?? '').replace(/^::ffff:/, '');
+}
 function describeDevice(ua = '') {
   const browser = /Edg\//.test(ua) ? 'Edge' : /OPR\//.test(ua) ? 'Opera' : /Chrome\//.test(ua) ? 'Chrome' : /Firefox\//.test(ua) ? 'Firefox' : /Safari\//.test(ua) ? 'Safari' : ua ? 'a browser' : 'unknown';
   const system = /Windows/.test(ua) ? 'Windows' : /Android/.test(ua) ? 'Android' : /iPhone|iPad/.test(ua) ? 'iOS' : /Mac OS X/.test(ua) ? 'macOS' : /Linux/.test(ua) ? 'Linux' : '';
@@ -666,7 +690,7 @@ function describeDevice(ua = '') {
 /** Opens a dashboard session for this browser (after a password, a token or a one-time code checked out). */
 function openSession(req, via) {
   const at = new Date().toISOString();
-  const address = String(req.socket.remoteAddress ?? '').replace(/^::ffff:/, '');
+  const address = clientAddress(req);
   const id = crypto.randomBytes(6).toString('hex');
   const sessionToken = 'ahs_' + crypto.randomBytes(24).toString('base64url');
   users.addSession.run(id, sha256(sessionToken), at, at, describeDevice(req.headers['user-agent']), address, via);
@@ -676,7 +700,7 @@ function openSession(req, via) {
   return { token: sessionToken, session: id };
 }
 function tooManyFailures(req) {
-  const address = String(req.socket.remoteAddress ?? '').replace(/^::ffff:/, '');
+  const address = clientAddress(req);
   if (users.recentFailures.get(address, new Date(Date.now() - 600_000).toISOString()).n >= 20) throw httpError(429, 'too many failed sign-ins from this address: wait a few minutes');
   return address;
 }
@@ -690,7 +714,7 @@ route('POST', '/api/signup', async ({ req }) => {
   tooManyFailures(req);
   const { username, password, setupCode: code } = await readJson(req);
   if (!isLoopback(req) && (!setupCode || String(code ?? '').trim().toUpperCase() !== setupCode)) {
-    users.logSignIn.run(new Date().toISOString(), String(req.socket.remoteAddress ?? '').replace(/^::ffff:/, ''), 'sign-up', 0, null);
+    users.logSignIn.run(new Date().toISOString(), clientAddress(req), 'sign-up', 0, null);
     throw httpError(403, 'create the account on the hub\'s own computer, or enter the setup code the hub printed when it started');
   }
   const name = String(username ?? '').trim();
@@ -761,7 +785,7 @@ route('POST', '/api/account/password', async ({ me, req }) => {
 });
 
 route('POST', '/api/sessions', async ({ req }) => {
-  const address = String(req.socket.remoteAddress ?? '').replace(/^::ffff:/, '');
+  const address = clientAddress(req);
   const now = Date.now();
   // slow down guessing: 20 failed sign-ins per address per 10 minutes
   if (users.recentFailures.get(address, new Date(now - 600_000).toISOString()).n >= 20) throw httpError(429, 'too many failed sign-ins from this address: wait a few minutes');
@@ -796,6 +820,39 @@ route('DELETE', '/api/sessions/([0-9a-f]+)', ({ me, params }) => {
 route('POST', '/api/login-codes', ({ me }) => {
   if (!me.admin) throw httpError(403, 'admin only');
   return { code: newLoginCode(), expiresIn: 300 };
+});
+
+// ---------- where agents can reach the hub ----------
+/** Every address the hub answers on, best first: public links, then this network and Tailscale, then this computer. */
+function hubAddresses() {
+  const list = [];
+  const add = (kind, label, url) => { if (!list.some((x) => x.url === url)) list.push({ kind, label, url }); };
+  if (PUBLIC_URL) add('public', 'Address set for agents (--public-url)', PUBLIC_URL);
+  for (const item of String(process.env.HUB_EXTRA_URLS ?? '').split(',').map((x) => x.trim()).filter(Boolean)) {
+    const [label, url] = item.includes('=') ? [item.slice(0, item.indexOf('=')), item.slice(item.indexOf('=') + 1)] : ['Other address', item];
+    add(/^https:/.test(url) && !/\.ts\.net/.test(url) ? 'public' : /\.ts\.net|\/\/100\./.test(url) ? 'tailscale' : 'network', label, url.replace(/\/$/, ''));
+  }
+  const open = HOST === '0.0.0.0' || HOST === '::';
+  if (open || !['127.0.0.1', 'localhost', '::1'].includes(HOST)) {
+    for (const [name, nets] of Object.entries(os.networkInterfaces())) {
+      for (const n of nets ?? []) {
+        if (n.family !== 'IPv4' || n.internal || n.address.startsWith('169.254.')) continue;
+        if (!open && n.address !== HOST) continue;
+        const [a, b] = n.address.split('.').map(Number);
+        const tailscale = a === 100 && b >= 64 && b <= 127;
+        const virtual = /vEthernet|VirtualBox|VMware|Hyper-V|WSL|docker|br-|virbr|veth/i.test(name);
+        add(tailscale ? 'tailscale' : virtual ? 'virtual' : 'network', tailscale ? 'Tailscale (your devices, anywhere)' : virtual ? `Virtual network (${name})` : `Local network (${name})`, `${SCHEME}://${n.address}:${PORT}`);
+      }
+    }
+  }
+  add('local', 'This computer only', `${SCHEME}://127.0.0.1:${PORT}`);
+  const rank = { public: 0, tailscale: 2, network: 1, virtual: 3, local: 4 };
+  return list.sort((x, y) => rank[x.kind] - rank[y.kind]);
+}
+route('GET', '/api/addresses', ({ me }) => {
+  if (!me.admin) throw httpError(403, 'admin only');
+  const open = HOST === '0.0.0.0' || HOST === '::';
+  return { listening: HOST, port: PORT, scheme: SCHEME, sharedOnNetwork: open || !['127.0.0.1', 'localhost', '::1'].includes(HOST), addresses: hubAddresses() };
 });
 
 // ---------- chats: the admin starts group chats and adds or removes their members ----------
@@ -923,7 +980,15 @@ db.a2aTasks ??= {};
 const taskByMessage = new Map(); // hub message id -> A2A task id
 for (const t of Object.values(db.a2aTasks)) for (const mid of t.hubMessages) taskByMessage.set(mid, t.id);
 const taskWatchers = new Map(); // task id -> Set of listeners
-const baseUrl = (req) => PUBLIC_URL || `http://${req.headers.host}`;
+function baseUrl(req) {
+  if (PUBLIC_URL) return PUBLIC_URL;
+  if (proxied(req)) {
+    const proto = String(req.headers['x-forwarded-proto'] ?? 'https').split(',')[0].trim();
+    const host = String(req.headers['x-forwarded-host'] ?? req.headers.host).split(',')[0].trim();
+    return `${proto}://${host}`;
+  }
+  return `${SCHEME}://${req.headers.host}`;
+}
 const textOf = (parts) => (Array.isArray(parts) ? parts.filter((x) => x && typeof x.text === 'string' && (x.kind ?? x.type ?? 'text') === 'text').map((x) => x.text).join('\n') : '');
 const agentMessage = (text, t) => ({ kind: 'message', role: 'agent', parts: [{ kind: 'text', text }], messageId: crypto.randomUUID(), taskId: t.id, contextId: t.contextId });
 
@@ -1212,7 +1277,7 @@ self.addEventListener('fetch', (e) => {
 });
 `;
 
-const server = http.createServer(async (req, res) => {
+const handler = async (req, res) => {
   const url = new URL(req.url ?? '/', 'http://hub');
   try {
     if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/index.html')) {
@@ -1274,7 +1339,8 @@ const server = http.createServer(async (req, res) => {
     if (!res.headersSent) send(res, e.status ?? 500, { error: e.status ? e.message : 'internal error' });
     if (!e.status) console.error(e);
   }
-});
+};
+const server = SCHEME === 'https' ? https.createServer({ cert: fs.readFileSync(TLS_CERT), key: fs.readFileSync(TLS_KEY) }, handler) : http.createServer(handler);
 
 server.on('error', (e) => {
   if (e.code !== 'EADDRINUSE') throw e;
@@ -1282,10 +1348,11 @@ server.on('error', (e) => {
   process.exit(1);
 });
 server.listen(PORT, HOST, () => {
-  console.log(`Agent Hub ${VERSION} listening on http://${HOST}:${PORT}${HOST === '127.0.0.1' ? ' (this machine only; use --host 0.0.0.0 or HUB_HOST=0.0.0.0 to open it to the network)' : ''}`);
+  console.log(`Agent Hub ${VERSION} listening on ${SCHEME}://${HOST}:${PORT}${HOST === '127.0.0.1' ? ' (this machine only; use --host 0.0.0.0 or HUB_HOST=0.0.0.0 to open it to the network)' : ''}`);
+  if (HOST !== '127.0.0.1') for (const a of hubAddresses().filter((x) => x.kind !== 'local')) console.log(`  ${a.label}: ${a.url}`);
   console.log(`Data: ${DATA}${HISTORY ? `\nChat history: ${path.resolve(HISTORY)}` : ''}`);
   if (OPEN) {
-    const url = `http://127.0.0.1:${PORT}/`;
+    const url = `${SCHEME}://127.0.0.1:${PORT}/`;
     const [cmd, cmdArgs] = process.platform === 'win32' ? ['cmd', ['/c', 'start', '""', url]] : [process.platform === 'darwin' ? 'open' : 'xdg-open', [url]];
     spawn(cmd, cmdArgs, { detached: true, stdio: 'ignore', windowsHide: true }).on('error', () => console.log(`Open ${url} in your browser.`)).unref();
   }
